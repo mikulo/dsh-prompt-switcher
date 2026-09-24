@@ -18,6 +18,11 @@
  *   folds that message from the full log, so the binding survives resume and
  *   fork; a pre-step hook re-injects the same snapshot whenever compaction has
  *   dropped it from the model-visible history, so every later turn obeys it.
+ * - Global prompt: one `.md` file (named after the file) or a custom text
+ *   (named by the user). While enabled, the pre-step hook binds a snapshot of
+ *   it to every brand-new top-level conversation through the same channel
+ *   (source kind `prompt-switcher-global`). A template picked with `/` is
+ *   appended AFTER the global prompt; it never replaces it.
  *
  * Plain ESM, no dependencies: only `node:` built-ins and duck-typed Harness
  * services, so no install-time build or registry access is required.
@@ -25,6 +30,9 @@
 
 import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
+import { request as httpRequest } from 'node:http'
+import { connect as netConnect, isIP, isIPv4, isIPv6 } from 'node:net'
+import { connect as tlsConnect } from 'node:tls'
 import { mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, resolve } from 'node:path'
@@ -40,6 +48,8 @@ export const inject = ['webServer', 'sessionProjections']
 
 /** Message source kind that marks the injected template (never a shared kind). */
 export const SOURCE_KIND = 'prompt-switcher'
+/** Message source kind that marks the injected global prompt. */
+export const GLOBAL_SOURCE_KIND = 'prompt-switcher-global'
 /** Session projection key (unique across the composition). */
 const PROJECTION_KEY = 'promptSwitcher'
 /** The one host command the Browser half submits. */
@@ -49,13 +59,15 @@ export const COMMAND_NAME = 'prompt-template'
  * on its own, while a changed Host half needs a `dsh web` restart; the client
  * compares this value to tell the user so instead of failing obscurely.
  */
-export const HOST_PROTOCOL = 3
+export const HOST_PROTOCOL = 5
 /** HTTP route family. */
 const API = '/api/dsh-prompt-switcher'
 /** Cap on one template file (1 MiB, the same per-file cap agent-instructions uses). */
 const MAX_TEMPLATE_BYTES = 1024 * 1024
-/** Cap on JSON request bodies. */
-const MAX_BODY_BYTES = 64 * 1024
+/** Cap on JSON request bodies (large enough for a full-size custom global prompt). */
+const MAX_BODY_BYTES = 4 * 1024 * 1024
+/** Cap on the user-chosen name of a custom global prompt. */
+const MAX_GLOBAL_NAME = 80
 
 // ───────────────────────────────────────────────────────────── settings store
 
@@ -67,6 +79,44 @@ function storePath() {
   return join(home, 'dsh-prompt-switcher.json')
 }
 
+/**
+ * Normalize the global-prompt settings.
+ * - `source: 'file'` uses the `.md` file at `filePath` (chosen from the template
+ *   list; its name is the file name without extension);
+ * - `source: 'custom'` uses the text the user typed under the name they chose;
+ *   saving it writes `<template directory>/<name>.md` (`customFile`). Settings
+ *   written by 1.2.0 kept the text inline (`customContent`); it is still read
+ *   until the prompt is saved again.
+ */
+function normalizeGlobal(raw) {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  return {
+    enabled: value.enabled === true,
+    source: value.source === 'custom' ? 'custom' : 'file',
+    filePath: typeof value.filePath === 'string' ? value.filePath : '',
+    customName: typeof value.customName === 'string' ? value.customName : '',
+    customFile: typeof value.customFile === 'string' ? value.customFile : '',
+    customContent: typeof value.customContent === 'string' ? value.customContent : '',
+  }
+}
+
+/** Default proxy address once the user turns the WebDAV proxy on. */
+const DEFAULT_PROXY_ADDRESS = '127.0.0.1:7891'
+
+/** Normalize the WebDAV sync settings (proxy off by default). */
+function normalizeWebdav(raw) {
+  const value = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const text = (key) => (typeof value[key] === 'string' ? value[key] : '')
+  return {
+    url: text('url').trim(),
+    username: text('username'),
+    password: text('password'),
+    proxyEnabled: value.proxyEnabled === true,
+    proxyType: value.proxyType === 'socks5' ? 'socks5' : 'http',
+    proxyAddress: text('proxyAddress').trim() || DEFAULT_PROXY_ADDRESS,
+  }
+}
+
 /** Read the settings file; a missing or malformed file reads as empty settings. */
 async function readStore() {
   try {
@@ -76,9 +126,11 @@ async function readStore() {
       active: raw?.active && typeof raw.active === 'object' && !Array.isArray(raw.active) ? { ...raw.active } : {},
       // Pin the templates above the built-in `/` commands (default on).
       pinTop: raw?.pinTop !== false,
+      global: normalizeGlobal(raw?.global),
+      webdav: normalizeWebdav(raw?.webdav),
     }
   } catch {
-    return { directory: '', active: {}, pinTop: true }
+    return { directory: '', active: {}, pinTop: true, global: normalizeGlobal(undefined), webdav: normalizeWebdav(undefined) }
   }
 }
 
@@ -152,6 +204,7 @@ async function describeState() {
     pinTop: store.pinTop,
     error: scan.error,
     templates: scan.templates.map(t => ({ ...t, active: store.active[t.file] === true })),
+    global: await describeGlobal(store),
   }
 }
 
@@ -238,6 +291,166 @@ async function loadActiveTemplate(key) {
   return { template: { ...found, content } }
 }
 
+// ───────────────────────────────────────────────────────────── global prompt
+
+/** Display name of a global prompt: the `.md` file name, or the user's own name. */
+function globalName(global) {
+  if (global.source === 'custom') return global.customName.trim()
+  return global.filePath ? basename(global.filePath, extname(global.filePath)) : ''
+}
+
+/**
+ * Why `name` cannot be a file name (on any platform), or `undefined` when it can.
+ * @param name - a bare name (custom prompt title) or a file name with extension.
+ */
+function invalidFileName(name) {
+  if (typeof name !== 'string' || name.trim() === '') return '名称不能为空。'
+  if (/[<>:"/\\|?*\u0000-\u001f]/.test(name)) return '名称不能包含以下字符：< > : " / \\ | ? *'
+  if (/^[. ]|[. ]$/.test(name)) return '名称不能以点或空格开头或结尾。'
+  if (/^(con|prn|aux|nul|com\d|lpt\d)(\..*)?$/i.test(name)) return `“${name}”是系统保留名，请换一个名称。`
+  if (Buffer.byteLength(name, 'utf8') > 240) return '名称过长。'
+  return undefined
+}
+
+/** Same file on this platform (Windows and macOS file systems ignore case). */
+function samePath(a, b) {
+  if (!a || !b) return false
+  const x = resolve(a)
+  const y = resolve(b)
+  return process.platform === 'linux' ? x === y : x.toLowerCase() === y.toLowerCase()
+}
+
+/** Read one prompt file (BOM stripped), or a readable reason it cannot be used. */
+async function readPromptFile(path, label) {
+  let info
+  try {
+    info = await stat(path)
+  } catch {
+    return { error: `${label}文件不存在：${path}` }
+  }
+  if (!info.isFile()) return { error: `${label}不是文件：${path}` }
+  if (info.size > MAX_TEMPLATE_BYTES) return { error: `${label}文件超过 1 MiB：${path}` }
+  const content = (await readFile(path, 'utf8')).replace(/^\uFEFF/, '')
+  return { content }
+}
+
+/**
+ * Read the configured global prompt's text.
+ * @returns `{ name, file, content }` or `{ error }` (a readable reason).
+ */
+async function readGlobalContent(global) {
+  if (global.source === 'custom') {
+    const name = global.customName.trim()
+    if (name === '') return { error: '请为自定义全局提示词填写名称并保存。' }
+    if (global.customFile) {
+      const read = await readPromptFile(global.customFile, '自定义全局提示词')
+      if (read.error) return read
+      if (read.content.trim() === '') return { error: '自定义全局提示词内容为空。' }
+      return { name, file: basename(global.customFile), content: read.content }
+    }
+    // Inline text saved by 1.2.0.
+    if (global.customContent.trim() === '') return { error: '自定义全局提示词内容为空。' }
+    return { name, file: '', content: global.customContent }
+  }
+  if (global.filePath === '') return { error: '请选择一个 .md 文件作为全局提示词。' }
+  const read = await readPromptFile(global.filePath, '全局提示词')
+  if (read.error) return read
+  if (read.content.trim() === '') return { error: `全局提示词文件内容为空：${global.filePath}` }
+  return { name: globalName(global), file: basename(global.filePath), content: read.content }
+}
+
+/** Current text of the custom global prompt for the editor (its file, else the legacy inline text). */
+async function customGlobalText(global) {
+  if (!global.customFile) return global.customContent
+  const read = await readPromptFile(global.customFile, '')
+  return read.error ? '' : read.content.replace(/\r\n/g, '\n')
+}
+
+/**
+ * Save the custom global prompt as `<directory>/<name>.md`.
+ * An existing file of that name that is not already this prompt's file is
+ * only replaced with `overwrite` (otherwise a 409 the client turns into a
+ * confirmation). Renaming writes a new file and leaves the old one in place.
+ * @returns the updated global settings.
+ */
+async function saveCustomGlobal(store, global, name, content, overwrite) {
+  if (!store.directory) throw new Error('请先在“提示词设置”中配置模板目录：自定义全局提示词会保存为该目录下的“名称.md”文件。')
+  const problem = invalidFileName(name)
+  if (problem) throw new Error(problem)
+  if ([...name].length > MAX_GLOBAL_NAME) throw new Error(`名称不能超过 ${MAX_GLOBAL_NAME} 个字符。`)
+  let text = content.replace(/\r\n/g, '\n')
+  if (text.trim() === '') throw new Error('全局提示词内容不能为空。')
+  const file = `${name}.md`
+  const target = join(store.directory, file)
+  let existing
+  try {
+    existing = await stat(target)
+  } catch { /* new file */ }
+  if (existing && !existing.isFile()) throw new Error(`模板目录中已有同名的文件夹：${file}`)
+  if (existing && !overwrite && !samePath(target, global.customFile)) {
+    const conflict = new Error(`模板目录中已存在同名文件“${file}”。`)
+    conflict.status = 409
+    conflict.payload = { conflict: 'file-exists', file }
+    throw conflict
+  }
+  // Keep an existing file's BOM and CRLF conventions.
+  let bom = false
+  if (existing) {
+    const raw = await readFile(target, 'utf8')
+    bom = raw.startsWith('\uFEFF')
+    if (/\r\n/.test(raw)) text = text.replace(/\n/g, '\r\n')
+  }
+  if (Buffer.byteLength(text, 'utf8') > MAX_TEMPLATE_BYTES) throw new Error('内容超过 1 MiB，未保存。')
+  await writeFile(target, (bom ? '\uFEFF' : '') + text, 'utf8')
+  return { ...global, customName: name, customFile: target, customContent: '' }
+}
+
+/** Settings-page view of the global prompt (with the reason it cannot apply, if any). */
+async function describeGlobal(store) {
+  const global = store.global
+  const file = global.filePath ? basename(global.filePath) : ''
+  let error
+  if (global.enabled) {
+    const read = await readGlobalContent(global)
+    error = read.error
+  }
+  return {
+    enabled: global.enabled,
+    source: global.source,
+    filePath: global.filePath,
+    file,
+    // Whether the chosen file lives in the current template directory (the list offers it).
+    inDirectory: global.filePath !== '' && store.directory !== '' && samePath(dirname(global.filePath), store.directory),
+    customName: global.customName,
+    customFile: global.customFile,
+    customContent: await customGlobalText(global),
+    name: globalName(global),
+    // In effect for new conversations right now.
+    effective: global.enabled && error === undefined,
+    error,
+  }
+}
+
+/**
+ * The global prompt a new conversation should bind right now.
+ * @returns `undefined` when disabled, `{ binding }` when usable, `{ error }` otherwise.
+ */
+async function loadGlobalPrompt() {
+  const store = await readStore()
+  if (!store.global.enabled) return undefined
+  const read = await readGlobalContent(store.global)
+  if (read.error) return { error: read.error }
+  return {
+    binding: {
+      name: read.name,
+      file: read.file,
+      origin: store.global.source,
+      digest: createHash('sha1').update(read.content, 'utf8').digest('hex'),
+      text: renderGlobal(read.name, read.file, read.content),
+    },
+  }
+}
+
 // ───────────────────────────────────────────────────────────── model message
 
 /** Keep template text from closing the plugin-owned frame (same rule as agent-instructions). */
@@ -245,15 +458,38 @@ function escapeFrame(text) {
   return text.replace(/<\/system-reminder>/gi, '<\\/system-reminder>')
 }
 
-/** Model-visible text of a bound template: AGENTS.md framing and authority. */
-function renderTemplate(name, file, content) {
+/**
+ * Model-visible text of a bound template: AGENTS.md framing and authority.
+ * @param globalName - name of the global prompt already bound to this
+ *   conversation, if any: the template is appended to it, never replacing it.
+ */
+function renderTemplate(name, file, content, globalName) {
   return [
     '<system-reminder>',
     `The user started this conversation with the prompt template "${escapeFrame(name)}". ` +
       'Treat it exactly like workspace instructions from AGENTS.md: it applies to this entire conversation, ' +
-      'including every later turn, until the conversation ends. It does not override system, developer, or direct user instructions.',
+      'including every later turn, until the conversation ends. It does not override system, developer, or direct user instructions.' +
+      (globalName
+        ? ` This template is appended after the global prompt "${escapeFrame(globalName)}": both apply together, and this template does not replace or cancel the global prompt.`
+        : ''),
     '',
     `Instructions from prompt template: ${escapeFrame(file)}`,
+    '',
+    escapeFrame(content.trim()),
+    '</system-reminder>',
+  ].join('\n')
+}
+
+/** Model-visible text of the global prompt: AGENTS.md framing and authority. */
+function renderGlobal(name, file, content) {
+  return [
+    '<system-reminder>',
+    `The user configured the global prompt "${escapeFrame(name)}" for every new conversation. ` +
+      'Treat it exactly like workspace instructions from AGENTS.md: it applies to this entire conversation, ' +
+      'including every later turn, until the conversation ends. It does not override system, developer, or direct user instructions. ' +
+      'If a prompt template is also selected for this conversation, that template is appended after this global prompt and both apply together.',
+    '',
+    `Instructions from global prompt: ${escapeFrame(file || name)}`,
     '',
     escapeFrame(content.trim()),
     '</system-reminder>',
@@ -285,9 +521,37 @@ function templateMessage(binding) {
   })
 }
 
+/** The sourced global-prompt message; the text is the durable snapshot. */
+function globalMessage(binding) {
+  return userMessage([{ type: 'text', text: binding.text }], {
+    kind: GLOBAL_SOURCE_KIND,
+    form: 'instructions',
+    prompt: binding.name,
+    file: binding.file,
+    origin: binding.origin,
+    digest: binding.digest,
+  })
+}
+
 /** Whether a message is this plugin's template message. */
 function isTemplateMessage(message) {
   return message?.role === 'user' && message?.source?.kind === SOURCE_KIND
+}
+
+/** Whether a message is this plugin's global-prompt message. */
+function isGlobalMessage(message) {
+  return message?.role === 'user' && message?.source?.kind === GLOBAL_SOURCE_KIND
+}
+
+/** Global binding carried by a global-prompt message. */
+function globalFromMessage(message) {
+  return {
+    name: String(message.source.prompt ?? ''),
+    file: String(message.source.file ?? ''),
+    origin: String(message.source.origin ?? ''),
+    digest: String(message.source.digest ?? ''),
+    text: messageText(message),
+  }
 }
 
 /** Plain text of a message's text blocks. */
@@ -365,6 +629,7 @@ function route(path, methods, handle) {
         writeJson(res, status, {
           error: error instanceof Error ? error.message : String(error),
           ...(typeof error?.mtime === 'number' ? { mtime: error.mtime } : {}),
+          ...(error?.payload && typeof error.payload === 'object' ? error.payload : {}),
         })
       }
     },
@@ -453,6 +718,551 @@ function launchOpenWith(path) {
   })
 }
 
+// ───────────────────────────────────────────────────────────── WebDAV sync
+
+/** Per-request budget (connect + proxy handshake + TLS + response). */
+const WEBDAV_TIMEOUT_MS = 20_000
+/** Cap on a PROPFIND listing body. */
+const MAX_LISTING_BYTES = 8 * 1024 * 1024
+const PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?>\n' +
+  '<d:propfind xmlns:d="DAV:"><d:prop><d:resourcetype/><d:getcontentlength/><d:getlastmodified/></d:prop></d:propfind>'
+
+/** WebDAV settings as the browser sees them: the password never leaves the host. */
+function publicWebdav(webdav) {
+  const { password, ...rest } = webdav
+  return { ...rest, hasPassword: password !== '', defaultProxyAddress: DEFAULT_PROXY_ADDRESS }
+}
+
+/** Parse the configured directory URL (always with a trailing slash). */
+function parseDavUrl(raw) {
+  const text = String(raw ?? '').trim()
+  if (text === '') throw new Error('请先填写 WebDAV 地址。')
+  let url
+  try {
+    url = new URL(text)
+  } catch {
+    throw new Error('WebDAV 地址格式不正确，例如 https://dav.example.com/dav/prompts/')
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new Error('WebDAV 地址必须以 http:// 或 https:// 开头。')
+  if (url.username || url.password) throw new Error('请把用户名和密码填在对应的输入框中，不要写进地址。')
+  url.hash = ''
+  url.search = ''
+  if (!url.pathname.endsWith('/')) url.pathname += '/'
+  return url
+}
+
+/** Parse `host:port` (an optional `http://` / `socks5://` prefix is tolerated). */
+function parseProxyAddress(raw) {
+  const text = String(raw ?? '').trim().replace(/^[a-z][a-z0-9+.-]*:\/\//i, '').replace(/\/+$/, '')
+  const match = /^(?:\[([0-9a-fA-F:.]+)\]|([^\s:[\]/]+)):(\d{1,5})$/.exec(text)
+  const port = match ? Number(match[3]) : 0
+  if (!match || port < 1 || port > 65535) throw new Error(`代理地址格式应为“主机:端口”，例如 ${DEFAULT_PROXY_ADDRESS}`)
+  return { host: match[1] ?? match[2], port }
+}
+
+/** Human description of the route a request takes (shown in test results). */
+function describeRoute(config) {
+  if (!config.proxyEnabled) return '直连'
+  return `经 ${config.proxyType === 'socks5' ? 'SOCKS5' : 'HTTP'} 代理 ${config.proxyAddress}`
+}
+
+/** Open a TCP connection; `track` receives the socket so a timeout can destroy it. */
+function openSocket(host, port, track) {
+  return new Promise((resolveSocket, rejectSocket) => {
+    const socket = netConnect({ host, port })
+    track(socket)
+    const onError = (error) => rejectSocket(error)
+    socket.once('error', onError)
+    socket.once('connect', () => {
+      socket.removeListener('error', onError)
+      resolveSocket(socket)
+    })
+  })
+}
+
+/**
+ * Read from `socket` until `check(buffer)` returns the length of a complete
+ * message (>= 0); surplus bytes are pushed back for the next reader.
+ */
+function readUntil(socket, check) {
+  return new Promise((resolveRead, rejectRead) => {
+    let buffer = Buffer.alloc(0)
+    let done = false
+    const finish = () => {
+      done = true
+      socket.removeListener('readable', onReadable)
+      socket.removeListener('error', onError)
+      socket.removeListener('end', onEnd)
+    }
+    const onError = (error) => { finish(); rejectRead(error) }
+    const onEnd = () => { finish(); rejectRead(new Error('代理提前关闭了连接')) }
+    function onReadable() {
+      let chunk
+      while (!done && (chunk = socket.read()) !== null) {
+        buffer = Buffer.concat([buffer, chunk])
+        let used
+        try {
+          used = check(buffer)
+        } catch (error) {
+          finish()
+          rejectRead(error)
+          return
+        }
+        if (used >= 0) {
+          finish()
+          if (used < buffer.length) socket.unshift(buffer.subarray(used))
+          resolveRead(buffer.subarray(0, used))
+          return
+        }
+      }
+    }
+    socket.on('readable', onReadable)
+    socket.once('error', onError)
+    socket.once('end', onEnd)
+  })
+}
+
+/** Tunnel through an HTTP proxy with CONNECT (works for http and https targets). */
+async function httpProxyTunnel(proxy, host, port, track) {
+  const socket = await openSocket(proxy.host, proxy.port, track).catch((error) => {
+    throw proxyError(error, proxy, 'HTTP')
+  })
+  const authority = isIPv6(host) ? `[${host}]:${port}` : `${host}:${port}`
+  socket.write(`CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`)
+  const head = await readUntil(socket, (buffer) => {
+    const end = buffer.indexOf('\r\n\r\n')
+    if (end >= 0) return end + 4
+    if (buffer.length > 16 * 1024) throw new Error('HTTP 代理返回了无效的响应')
+    return -1
+  })
+  const status = /^HTTP\/\d(?:\.\d)? (\d{3})/.exec(head.toString('latin1'))?.[1]
+  if (status !== '200') {
+    socket.destroy()
+    throw Object.assign(new Error(status === '407'
+      ? `HTTP 代理 ${proxy.host}:${proxy.port} 需要认证（407），本插件暂不支持带认证的代理`
+      : `HTTP 代理拒绝了到 ${authority} 的连接（${status ?? '无效响应'}），请确认代理类型选择正确`), { proxy: true })
+  }
+  return socket
+}
+
+const SOCKS5_ERRORS = {
+  1: '代理服务器内部错误',
+  2: '代理规则不允许该连接',
+  3: '网络不可达',
+  4: '目标主机不可达',
+  5: '目标拒绝连接',
+  6: '连接超时',
+  7: '代理不支持该命令',
+  8: '代理不支持该地址类型',
+}
+
+/** Tunnel through a SOCKS5 proxy (no authentication; the proxy resolves the host name). */
+async function socks5Tunnel(proxy, host, port, track) {
+  const socket = await openSocket(proxy.host, proxy.port, track).catch((error) => {
+    throw proxyError(error, proxy, 'SOCKS5')
+  })
+  const fail = (message) => {
+    socket.destroy()
+    return Object.assign(new Error(message), { proxy: true })
+  }
+  socket.write(Buffer.from([5, 1, 0]))
+  const hello = await readUntil(socket, (buffer) => (buffer.length >= 2 ? 2 : -1))
+  if (hello[0] !== 5) throw fail(`${proxy.host}:${proxy.port} 不是 SOCKS5 代理，请确认代理类型选择正确`)
+  if (hello[1] !== 0) throw fail(`SOCKS5 代理 ${proxy.host}:${proxy.port} 要求认证，本插件暂不支持带认证的代理`)
+  let address
+  if (isIPv4(host)) {
+    address = Buffer.from([1, ...host.split('.').map(Number)])
+  } else {
+    const name = Buffer.from(host, 'utf8')
+    if (name.length > 255) throw fail('主机名过长')
+    address = Buffer.concat([Buffer.from([3, name.length]), name])
+  }
+  socket.write(Buffer.concat([Buffer.from([5, 1, 0]), address, Buffer.from([port >> 8, port & 255])]))
+  const reply = await readUntil(socket, (buffer) => {
+    if (buffer.length < 5) return -1
+    const type = buffer[3]
+    const length = type === 1 ? 10 : type === 4 ? 22 : type === 3 ? 7 + buffer[4] : buffer.length
+    return buffer.length >= length ? length : -1
+  })
+  if (reply[1] !== 0) throw fail(`SOCKS5 代理无法连接 ${host}:${port}：${SOCKS5_ERRORS[reply[1]] ?? `错误码 ${reply[1]}`}`)
+  return socket
+}
+
+/** A failure to reach the proxy itself. */
+function proxyError(error, proxy, kind) {
+  const reason = error?.code === 'ECONNREFUSED' ? '连接被拒绝' : error?.code === 'ENOTFOUND' ? '无法解析主机名' : (error?.message ?? String(error))
+  return Object.assign(new Error(`无法连接 ${kind} 代理 ${proxy.host}:${proxy.port}（${reason}），请确认代理软件已启动、地址和端口正确`), { proxy: true })
+}
+
+/** Upgrade a connected socket to TLS. */
+function tlsWrap(socket, host, track) {
+  return new Promise((resolveTls, rejectTls) => {
+    const secure = tlsConnect({ socket, servername: isIP(host) ? undefined : host, ALPNProtocols: ['http/1.1'] })
+    track(secure)
+    const onError = (error) => rejectTls(error)
+    secure.once('error', onError)
+    secure.once('secureConnect', () => {
+      secure.removeListener('error', onError)
+      resolveTls(secure)
+    })
+  })
+}
+
+/** Readable network error text for WebDAV requests. */
+function networkErrorText(error) {
+  if (error?.proxy || error?.timeout) return error.message
+  const code = String(error?.code ?? '')
+  if (code === 'ECONNREFUSED') return '连接被拒绝，请检查地址和端口'
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return '无法解析服务器域名，请检查地址，或开启代理'
+  if (code === 'ECONNRESET' || code === 'EPIPE') return '连接被服务器或代理重置'
+  if (code === 'ETIMEDOUT' || code === 'ENETUNREACH' || code === 'EHOSTUNREACH') return '无法连接服务器（网络不可达或超时）'
+  if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY|ERR_TLS|ERR_SSL/.test(code)) return `TLS 证书校验失败：${error.message}`
+  if (code === 'EPROTO' || /wrong version number/i.test(error?.message ?? '')) return 'TLS 握手失败：地址的协议（http/https）或端口可能不正确'
+  return error?.message ?? String(error)
+}
+
+/**
+ * One WebDAV request (follows up to 3 redirects).
+ * @returns `{ status, headers, body }` with the full body buffered (capped at `maxBytes`).
+ */
+async function davRequest(config, method, url, { headers = {}, body, maxBytes = MAX_LISTING_BYTES, redirects = 3 } = {}) {
+  const target = new URL(url)
+  const secure = target.protocol === 'https:'
+  const host = target.hostname.replace(/^\[|\]$/g, '')
+  const port = Number(target.port) || (secure ? 443 : 80)
+  const sockets = []
+  const track = (socket) => { sockets.push(socket) }
+  let timer
+  const timeout = new Promise((_, rejectTimeout) => {
+    timer = setTimeout(() => {
+      for (const socket of sockets) socket.destroy()
+      rejectTimeout(Object.assign(new Error(`请求超时（${WEBDAV_TIMEOUT_MS / 1000} 秒，${describeRoute(config)}）`), { timeout: true }))
+    }, WEBDAV_TIMEOUT_MS)
+  })
+  const run = async () => {
+    let socket
+    if (config.proxyEnabled) {
+      const proxy = parseProxyAddress(config.proxyAddress)
+      socket = config.proxyType === 'socks5'
+        ? await socks5Tunnel(proxy, host, port, track)
+        : await httpProxyTunnel(proxy, host, port, track)
+    } else {
+      socket = await openSocket(host, port, track)
+    }
+    if (secure) socket = await tlsWrap(socket, host, track)
+    const payload = body === undefined ? undefined : Buffer.isBuffer(body) ? body : Buffer.from(body, 'utf8')
+    const auth = config.username !== '' || config.password !== ''
+      ? { authorization: 'Basic ' + Buffer.from(`${config.username}:${config.password}`, 'utf8').toString('base64') }
+      : {}
+    return await new Promise((resolveResponse, rejectResponse) => {
+      const req = httpRequest({
+        method,
+        host,
+        port,
+        path: target.pathname + target.search,
+        headers: {
+          host: target.host,
+          connection: 'close',
+          'user-agent': `dsh-prompt-switcher/${version}`,
+          ...auth,
+          ...headers,
+          ...(payload ? { 'content-length': String(payload.length) } : {}),
+        },
+        createConnection: () => socket,
+      })
+      req.once('error', rejectResponse)
+      req.once('response', (res) => {
+        const chunks = []
+        let size = 0
+        res.on('data', (chunk) => {
+          size += chunk.length
+          if (size > maxBytes) {
+            req.destroy(Object.assign(new Error('响应超过大小上限'), { tooLarge: true }))
+            return
+          }
+          chunks.push(chunk)
+        })
+        res.once('end', () => resolveResponse({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) }))
+        res.once('error', rejectResponse)
+      })
+      req.end(payload)
+    })
+  }
+  let response
+  try {
+    response = await Promise.race([run(), timeout])
+  } catch (error) {
+    if (error?.tooLarge) throw error
+    throw Object.assign(new Error(networkErrorText(error)), { network: true })
+  } finally {
+    clearTimeout(timer)
+    for (const socket of sockets) socket.destroy()
+  }
+  if ([301, 302, 303, 307, 308].includes(response.status) && response.headers.location && redirects > 0) {
+    const next = new URL(response.headers.location, target)
+    return davRequest(config, method, next.href, { headers, body, maxBytes, redirects: redirects - 1 })
+  }
+  return response
+}
+
+/** Readable text for an unexpected WebDAV status. */
+function davStatusText(status, action) {
+  if (status === 401) return `${action}失败：认证失败（401），请检查用户名和密码`
+  if (status === 403) return `${action}失败：没有权限（403）`
+  if (status === 404) return `${action}失败：路径不存在（404）`
+  if (status === 405) return `${action}失败：服务器不允许该操作（405），请确认地址指向 WebDAV 目录`
+  if (status === 409) return `${action}失败：上级目录不存在（409）`
+  if (status === 423) return `${action}失败：资源被锁定（423）`
+  if (status === 507) return `${action}失败：云端空间不足（507）`
+  return `${action}失败：服务器返回 HTTP ${status}`
+}
+
+function decodeXml(text) {
+  return text
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&')
+}
+
+function safeDecode(text) {
+  try {
+    return decodeURIComponent(text)
+  } catch {
+    return text
+  }
+}
+
+/** Text of the first `<prefix:tag>` element in `xml` (any namespace prefix). */
+function xmlTag(xml, tag) {
+  const match = new RegExp(`<(?:[\\w.-]+:)?${tag}\\b[^>]*>([\\s\\S]*?)</(?:[\\w.-]+:)?${tag}\\s*>`, 'i').exec(xml)
+  return match ? decodeXml(match[1]).trim() : undefined
+}
+
+/** Normalized, decoded path without a trailing slash. */
+function davPath(pathname) {
+  return safeDecode(pathname).replace(/\/{2,}/g, '/').replace(/\/+$/, '')
+}
+
+/**
+ * The `.md` files directly inside the listed directory (no collections, no
+ * sub-directories) from a PROPFIND Depth: 1 multistatus body.
+ */
+function parseListing(xml, base) {
+  const directory = davPath(base.pathname)
+  const files = []
+  const responses = xml.match(/<(?:[\w.-]+:)?response\b[^>]*>[\s\S]*?<\/(?:[\w.-]+:)?response\s*>/gi) ?? []
+  for (const block of responses) {
+    const href = xmlTag(block, 'href')
+    if (!href) continue
+    if (/<(?:[\w.-]+:)?collection\b/i.test(block)) continue
+    let path
+    try {
+      path = davPath(new URL(href, base).pathname)
+    } catch {
+      continue
+    }
+    const slash = path.lastIndexOf('/')
+    if (path.slice(0, slash) !== directory) continue
+    const name = path.slice(slash + 1)
+    if (name === '' || extname(name).toLowerCase() !== '.md') continue
+    const size = Number.parseInt(xmlTag(block, 'getcontentlength') ?? '', 10)
+    const mtime = Date.parse(xmlTag(block, 'getlastmodified') ?? '')
+    files.push({ name, size: Number.isFinite(size) ? size : null, mtime: Number.isFinite(mtime) ? mtime : null })
+  }
+  files.sort((a, b) => a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true }))
+  return files
+}
+
+/** URL of one file inside the configured directory. */
+function davFileUrl(base, name) {
+  return new URL(encodeURIComponent(name), base).href
+}
+
+/**
+ * List the remote directory.
+ * @returns `{ base, missing: true }` when it does not exist yet, else `{ base, missing: false, files }`.
+ */
+async function listRemote(config) {
+  const base = parseDavUrl(config.url)
+  const res = await davRequest(config, 'PROPFIND', base.href, {
+    headers: { depth: '1', 'content-type': 'application/xml; charset=utf-8' },
+    body: PROPFIND_BODY,
+  })
+  if (res.status === 404) return { base, missing: true, files: [] }
+  if (res.status !== 207 && res.status !== 200) throw new Error(davStatusText(res.status, '读取云端目录'))
+  return { base, missing: false, files: parseListing(res.body.toString('utf8'), base) }
+}
+
+/** Connection test: PROPFIND Depth: 0 on the directory with the given (possibly unsaved) settings. */
+async function testWebdav(config) {
+  const route = describeRoute(config)
+  try {
+    const base = parseDavUrl(config.url)
+    if (config.proxyEnabled) parseProxyAddress(config.proxyAddress)
+    const started = Date.now()
+    const res = await davRequest(config, 'PROPFIND', base.href, {
+      headers: { depth: '0', 'content-type': 'application/xml; charset=utf-8' },
+      body: PROPFIND_BODY,
+    })
+    const elapsed = Date.now() - started
+    if (res.status === 207 || res.status === 200) {
+      return { ok: true, message: `连接成功（${route}，HTTP ${res.status}，耗时 ${elapsed} ms）` }
+    }
+    if (res.status === 404) {
+      return { ok: true, warning: true, message: `已连接到服务器（${route}），但云端目录不存在；第一次“同步到云端”时会自动创建。` }
+    }
+    return { ok: false, message: `${davStatusText(res.status, '连接')}（${route}）` }
+  } catch (error) {
+    const text = error instanceof Error ? error.message : String(error)
+    return { ok: false, message: error?.network ? `连接失败：${text}` : text }
+  }
+}
+
+async function pathExists(path) {
+  try {
+    await stat(path)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Unique non-empty strings from a client-supplied array. */
+function nameList(value) {
+  return Array.isArray(value) ? [...new Set(value.filter(v => typeof v === 'string' && v !== ''))] : []
+}
+
+/** Configured template directory (sync target/source), or a readable error. */
+function requireDirectory(store) {
+  if (!store.directory) throw new Error('请先在“提示词设置”中配置模板目录。')
+  return store.directory
+}
+
+/** Remote listing for “同步到本地”: every remote `.md` plus whether a local file has that name. */
+async function remoteForPull(store) {
+  const directory = requireDirectory(store)
+  const listing = await listRemote(store.webdav)
+  if (listing.missing) throw new Error('云端目录不存在，请检查 WebDAV 地址。')
+  const files = []
+  for (const file of listing.files) {
+    files.push({ ...file, conflict: await pathExists(join(directory, file.name)), invalid: invalidFileName(file.name) })
+  }
+  return { url: listing.base.href, directory, files }
+}
+
+/** Local listing for “同步到云端”: every local `.md` plus whether the cloud has that name. */
+async function localForPush(store) {
+  const directory = requireDirectory(store)
+  const scan = await scanDirectory(directory)
+  if (scan.error) throw new Error(scan.error)
+  const listing = await listRemote(store.webdav)
+  const remote = new Set(listing.files.map(f => f.name))
+  return {
+    url: listing.base.href,
+    directory,
+    remoteMissing: listing.missing,
+    files: scan.templates.map(t => ({ name: t.file, size: t.size, mtime: t.mtime, conflict: remote.has(t.file) })),
+  }
+}
+
+/**
+ * Download the chosen remote files into the template directory. A file that
+ * exists locally is only replaced when named in `overwrite` (re-checked here).
+ */
+async function pullFiles(store, names, overwrite) {
+  const directory = requireDirectory(store)
+  const listing = await listRemote(store.webdav)
+  if (listing.missing) throw new Error('云端目录不存在，请检查 WebDAV 地址。')
+  const remote = new Set(listing.files.map(f => f.name))
+  const replace = new Set(nameList(overwrite))
+  const results = []
+  for (const name of nameList(names)) {
+    if (!remote.has(name)) {
+      results.push({ name, status: 'error', message: '云端已不存在该文件' })
+      continue
+    }
+    const problem = invalidFileName(name)
+    if (problem) {
+      results.push({ name, status: 'error', message: `文件名不能在本地使用：${problem}` })
+      continue
+    }
+    const target = join(directory, name)
+    const exists = await pathExists(target)
+    if (exists && !replace.has(name)) {
+      results.push({ name, status: 'skipped' })
+      continue
+    }
+    try {
+      const res = await davRequest(store.webdav, 'GET', davFileUrl(listing.base, name), { maxBytes: MAX_TEMPLATE_BYTES })
+      if (res.status !== 200) throw new Error(davStatusText(res.status, '下载'))
+      await writeFile(target, res.body)
+      results.push({ name, status: exists ? 'overwritten' : 'created' })
+    } catch (error) {
+      results.push({ name, status: 'error', message: error?.tooLarge ? '文件超过 1 MiB' : (error instanceof Error ? error.message : String(error)) })
+    }
+  }
+  return { results }
+}
+
+/**
+ * Upload the chosen local templates into the remote directory (created when
+ * missing). A remote file with the same name is only replaced when named in
+ * `overwrite` (re-checked here).
+ */
+async function pushFiles(store, names, overwrite) {
+  const directory = requireDirectory(store)
+  const scan = await scanDirectory(directory)
+  if (scan.error) throw new Error(scan.error)
+  const local = new Map(scan.templates.map(t => [t.file, t]))
+  const listing = await listRemote(store.webdav)
+  if (listing.missing) {
+    const res = await davRequest(store.webdav, 'MKCOL', listing.base.href)
+    if (res.status !== 201 && res.status !== 405) throw new Error(davStatusText(res.status, '创建云端目录'))
+  }
+  const remote = new Set(listing.files.map(f => f.name))
+  const replace = new Set(nameList(overwrite))
+  const results = []
+  for (const name of nameList(names)) {
+    const template = local.get(name)
+    if (!template) {
+      results.push({ name, status: 'error', message: '本地已不存在该文件' })
+      continue
+    }
+    const exists = remote.has(name)
+    if (exists && !replace.has(name)) {
+      results.push({ name, status: 'skipped' })
+      continue
+    }
+    try {
+      if (template.size > MAX_TEMPLATE_BYTES) throw new Error('文件超过 1 MiB')
+      const content = await readFile(join(directory, name))
+      const res = await davRequest(store.webdav, 'PUT', davFileUrl(listing.base, name), {
+        headers: { 'content-type': 'text/markdown; charset=utf-8' },
+        body: content,
+      })
+      if (![200, 201, 204].includes(res.status)) throw new Error(davStatusText(res.status, '上传'))
+      results.push({ name, status: exists ? 'overwritten' : 'created' })
+    } catch (error) {
+      results.push({ name, status: 'error', message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return { results }
+}
+
+/** Apply a settings-form body onto WebDAV settings (an empty password keeps the saved one). */
+function mergeWebdav(current, body) {
+  const next = { ...current }
+  if (typeof body.url === 'string') next.url = body.url.trim()
+  if (typeof body.username === 'string') next.username = body.username
+  if (typeof body.password === 'string' && body.password !== '') next.password = body.password
+  if (body.clearPassword === true) next.password = ''
+  if (typeof body.proxyEnabled === 'boolean') next.proxyEnabled = body.proxyEnabled
+  if (body.proxyType === 'http' || body.proxyType === 'socks5') next.proxyType = body.proxyType
+  if (typeof body.proxyAddress === 'string') next.proxyAddress = body.proxyAddress.trim() || DEFAULT_PROXY_ADDRESS
+  return next
+}
+
 // ───────────────────────────────────────────────────────────── plugin
 
 /**
@@ -461,35 +1271,43 @@ function launchOpenWith(path) {
 export function apply(ctx) {
   const logger = typeof ctx.logger === 'function' ? ctx.logger('prompt-switcher') : ctx.logger
 
-  /** Bindings made in this process whose message is not yet in the log. */
+  /** Template bindings made in this process whose message may not be in the log yet. */
   const pendingBindings = new WeakMap()
+  /** Global-prompt bindings made in this process whose message may not be in the log yet. */
+  const pendingGlobals = new WeakMap()
 
-  // ── durable binding: fold the first template message from the full log.
+  // ── durable bindings: fold the first template / global-prompt message from the full log.
   const projectionAvailable = (() => {
     try {
       ctx.sessionProjections.register({
         key: PROJECTION_KEY,
-        stateVersion: 1,
+        stateVersion: 2,
         // Plain JSON state; the registry only calls `parse` on persisted rows.
         stateSchema: {
           parse(value) {
-            if (value && typeof value === 'object' && 'bound' in value) return value
+            if (value && typeof value === 'object' && 'bound' in value) return { global: null, ...value }
             throw new Error('invalid prompt-switcher projection state')
           },
         },
-        init: () => ({ bound: null }),
+        init: () => ({ bound: null, global: null }),
         apply(state, event) {
-          if (state.bound !== null || event?.type !== 'user/message') return state
+          if (event?.type !== 'user/message') return state
           const message = event.data
-          if (!isTemplateMessage(message)) return state
-          return {
-            bound: {
-              name: String(message.source.template ?? ''),
-              file: String(message.source.file ?? ''),
-              digest: String(message.source.digest ?? ''),
-              text: messageText(message),
-            },
+          if (state.bound === null && isTemplateMessage(message)) {
+            return {
+              ...state,
+              bound: {
+                name: String(message.source.template ?? ''),
+                file: String(message.source.file ?? ''),
+                digest: String(message.source.digest ?? ''),
+                text: messageText(message),
+              },
+            }
           }
+          if ((state.global ?? null) === null && isGlobalMessage(message)) {
+            return { ...state, global: globalFromMessage(message) }
+          }
+          return state
         },
       })
       return true
@@ -518,11 +1336,34 @@ export function apply(ctx) {
     return undefined
   }
 
+  /** The global prompt bound to a session, if any (log fold, then in-flight, then visible history). */
+  const globalBindingOf = (session) => {
+    if (projectionAvailable) {
+      try {
+        const bound = ctx.sessionProjections.stateOf(session, PROJECTION_KEY)?.global
+        if (bound) return bound
+      } catch { /* session not projected yet */ }
+    }
+    const pending = pendingGlobals.get(session)
+    if (pending) return pending
+    try {
+      const visible = session.deriveMessages().find(isGlobalMessage)
+      if (visible) return globalFromMessage(visible)
+    } catch { /* no history access */ }
+    return undefined
+  }
+
+  /** Top-level user conversation (not a subagent, not seeded from another session). */
+  const isTopLevel = (session) => {
+    if (session.header?.isSeeded) return false
+    if ((session.header?.delegationDepth ?? 0) > 0 || session.header?.origin === 'subagent') return false
+    return true
+  }
+
   /** Whether the agent's session has never had a conversation turn. */
   const isFreshSession = (agent) => {
     const session = agent.session
-    if (session.header?.isSeeded) return false
-    if ((session.header?.delegationDepth ?? 0) > 0 || session.header?.origin === 'subagent') return false
+    if (!isTopLevel(session)) return false
     if (bindingOf(session)) return false
     try {
       const turns = ctx.sessionProjections.stateOf(session, 'turnBoundary')
@@ -535,23 +1376,77 @@ export function apply(ctx) {
     return true
   }
 
-  // ── keep the template in the model-visible history for every later step.
-  ctx.on('agent/pre-step', async ({ agent, step }, next) => {
+  /**
+   * Whether this pre-step opens the very first turn of a brand-new top-level
+   * conversation: the only moment a global prompt is bound. Conversations that
+   * started before the global prompt was enabled are never touched.
+   */
+  const isConversationStart = (session, turn) => {
+    if (!isTopLevel(session)) return false
+    let current = turn
+    if (typeof current !== 'number') {
+      try {
+        current = ctx.sessionProjections.stateOf(session, 'turnBoundary')?.lastTurn
+      } catch { /* projection absent */ }
+    }
+    if (typeof current === 'number' && current > 1) return false
+    let history
+    try {
+      history = session.deriveMessages()
+    } catch {
+      return false
+    }
+    return !history.some(m => m.role === 'assistant' ||
+      (m.role === 'user' && (m.source?.kind === 'user' || m.source?.kind === 'compaction')))
+  }
+
+  /** Resolve the global prompt for a conversation that starts now; failures only log. */
+  const bindGlobalNow = async (session) => {
+    let loaded
+    try {
+      loaded = await loadGlobalPrompt()
+    } catch (error) {
+      loaded = { error: error instanceof Error ? error.message : String(error) }
+    }
+    if (loaded?.error) {
+      logger?.warn?.('global prompt not applied: %s', loaded.error)
+      return { error: loaded.error }
+    }
+    if (!loaded?.binding) return {}
+    pendingGlobals.set(session, loaded.binding)
+    return { binding: loaded.binding }
+  }
+
+  // ── bind the global prompt to new conversations, and keep the global prompt
+  //    and template in the model-visible history for every later step
+  //    (global first, the template appended after it).
+  ctx.on('agent/pre-step', async ({ agent, step, turn }, next) => {
     const decision = await next()
     if (decision.kind === 'reject' || (step === 1 && decision.messages.length === 0)) return decision
-    const binding = bindingOf(agent.session)
-    if (!binding) return decision
-    if (decision.messages.some(isTemplateMessage)) {
-      pendingBindings.delete(agent.session)
-      return decision
+    const session = agent.session
+
+    let global = globalBindingOf(session)
+    if (!global && !decision.messages.some(isGlobalMessage) && isConversationStart(session, turn)) {
+      global = (await bindGlobalNow(session)).binding
     }
-    let visible = false
+    const template = bindingOf(session)
+    if (!global && !template) return decision
+
+    let history = []
     try {
-      visible = agent.session.deriveMessages().some(isTemplateMessage)
+      history = session.deriveMessages()
     } catch { /* treat as missing */ }
-    if (visible) return decision
-    // Compaction (or an interrupted first step) dropped it: re-inject the same snapshot first.
-    return { ...decision, messages: [templateMessage(binding), ...decision.messages] }
+    const prefix = []
+    // Missing from both this step and the visible history (new conversation,
+    // compaction, or an interrupted first step): re-inject the same snapshot.
+    if (global && !decision.messages.some(isGlobalMessage) && !history.some(isGlobalMessage)) {
+      prefix.push(globalMessage(global))
+    }
+    if (template && !decision.messages.some(isTemplateMessage) && !history.some(isTemplateMessage)) {
+      prefix.push(templateMessage(template))
+    }
+    if (prefix.length === 0) return decision
+    return { ...decision, messages: [...prefix, ...decision.messages] }
   })
 
   // ── the slash command the Browser half submits.
@@ -580,20 +1475,33 @@ export function apply(ctx) {
         if (loaded.error) return { kind: 'error', text: loaded.error }
         const { template } = loaded
 
+        // The global prompt (if enabled) is bound first; the template is appended after it.
+        let global = globalBindingOf(agent.session)
+        let globalError
+        if (!global) {
+          const bound = await bindGlobalNow(agent.session)
+          global = bound.binding
+          globalError = bound.error
+        }
+
         const binding = {
           name: template.name,
           file: template.file,
           digest: createHash('sha1').update(template.content, 'utf8').digest('hex'),
-          text: renderTemplate(template.name, template.file, template.content),
+          text: renderTemplate(template.name, template.file, template.content, global?.name),
         }
         pendingBindings.set(agent.session, binding)
         // Same order as /plan: model-facing context first, then the user's own message wakes the turn.
+        if (global) agent.inject(globalMessage(global))
         agent.inject(templateMessage(binding))
         agent.steer(userMessage(
           [...attachments, ...(message === '' ? [] : [{ type: 'text', text: message }])],
           { kind: 'user' },
         ))
-        return { kind: 'success', text: `已应用提示词模板「${template.name}」，本对话后续所有轮次都将遵守该模板。` }
+        const applied = global
+          ? `已应用全局提示词「${global.name}」，并在其后追加提示词模板「${template.name}」，本对话后续所有轮次都将同时遵守两者。`
+          : `已应用提示词模板「${template.name}」，本对话后续所有轮次都将遵守该模板。`
+        return { kind: 'success', text: globalError ? `${applied}（全局提示词未生效：${globalError}）` : applied }
       },
     })
   })
@@ -607,7 +1515,32 @@ export function apply(ctx) {
         hostProtocol: HOST_PROTOCOL,
         pinTop: state.pinTop,
         templates: state.templates.filter(t => t.active).map(({ id, name, file }) => ({ id, name, file })),
+        global: { effective: state.global.effective, name: state.global.name },
       }
+    }),
+    // Global prompt: partial update of { enabled, source, file, customName, customContent, overwrite }.
+    route('global', 'POST', async (body) => {
+      const store = await readStore()
+      let global = { ...store.global }
+      if (body.source === 'file' || body.source === 'custom') global.source = body.source
+      if (typeof body.file === 'string') {
+        // Only a file the current directory scan lists can be chosen (no arbitrary paths).
+        global.filePath = body.file === '' ? '' : (await resolveListedFile(body.file)).path
+      }
+      // The custom text is saved as `<template directory>/<name>.md`.
+      if (typeof body.customName === 'string' || typeof body.customContent === 'string') {
+        const name = typeof body.customName === 'string' ? body.customName.trim() : global.customName
+        const content = typeof body.customContent === 'string' ? body.customContent : await customGlobalText(global)
+        global = await saveCustomGlobal(store, global, name, content, body.overwrite === true)
+      }
+      if (typeof body.enabled === 'boolean') global.enabled = body.enabled
+      // Turning it on requires a usable prompt; other edits may be saved incomplete.
+      if (body.enabled === true) {
+        const read = await readGlobalContent(global)
+        if (read.error) throw new Error(read.error)
+      }
+      await writeStore({ ...store, global })
+      return describeState()
     }),
     route('settings', 'POST', async (body) => {
       const store = await readStore()
@@ -615,6 +1548,30 @@ export function apply(ctx) {
       await writeStore(store)
       return describeState()
     }),
+    // ── WebDAV sync (the password is write-only: it is never sent back).
+    route('webdav', {
+      GET: async () => {
+        const store = await readStore()
+        return { hostProtocol: HOST_PROTOCOL, directory: store.directory, webdav: publicWebdav(store.webdav) }
+      },
+      POST: async (body) => {
+        const store = await readStore()
+        const webdav = mergeWebdav(store.webdav, body)
+        if (webdav.url !== '') parseDavUrl(webdav.url)
+        parseProxyAddress(webdav.proxyAddress)
+        await writeStore({ ...store, webdav })
+        return { hostProtocol: HOST_PROTOCOL, directory: store.directory, webdav: publicWebdav(webdav) }
+      },
+    }),
+    // Test the settings currently in the form (saved password when the field is left empty).
+    route('webdav/test', 'POST', async (body) => {
+      const store = await readStore()
+      return testWebdav(mergeWebdav(store.webdav, body))
+    }),
+    route('webdav/remote-list', 'POST', async () => remoteForPull(await readStore())),
+    route('webdav/local-list', 'POST', async () => localForPush(await readStore())),
+    route('webdav/pull', 'POST', async (body) => pullFiles(await readStore(), body.files, body.overwrite)),
+    route('webdav/push', 'POST', async (body) => pushFiles(await readStore(), body.files, body.overwrite)),
     // Editor: full text (GET ?file=) or only its version (GET ?file=&meta=1) for change polling.
     route('file', {
       GET: async (_body, req) => {

@@ -196,5 +196,133 @@ assert.deepEqual(decision.messages, [followUp])
 decision = await preStep({ agent, step: 2 }, async () => ({ kind: 'reject' }))
 assert.equal(decision.kind, 'reject')
 
+// ── global prompt: settings
+r = await hit('state')
+assert.deepEqual(
+  { enabled: r.payload.global.enabled, source: r.payload.global.source, effective: r.payload.global.effective },
+  { enabled: false, source: 'file', effective: false },
+)
+r = await hit('global', 'POST', { enabled: true })
+assert.equal(r.status, 400, 'cannot enable without a file')
+r = await hit('global', 'POST', { file: '../x.md' })
+assert.equal(r.status, 400, 'only listed files')
+r = await hit('global', 'POST', { file: 'Writer.MD' })
+assert.equal(r.payload.global.name, 'Writer')
+assert.equal(r.payload.global.inDirectory, true)
+assert.equal(r.payload.global.enabled, false)
+r = await hit('global', 'POST', { enabled: true })
+assert.equal(r.status, 200)
+assert.equal(r.payload.global.effective, true)
+assert.deepEqual((await hit('templates')).payload.global, { effective: true, name: 'Writer' })
+
+// ── global prompt: every new conversation binds it
+const gMsgOf = (messages) => messages.filter(m => m.source?.kind === plugin.GLOBAL_SOURCE_KIND)
+const plain = { role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'hi' }] }
+const fresh = makeAgent()
+decision = await preStep({ agent: fresh, step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
+assert.equal(decision.messages.length, 2)
+const gMsg = decision.messages[0]
+assert.equal(gMsg.source.kind, plugin.GLOBAL_SOURCE_KIND)
+assert.equal(gMsg.source.prompt, 'Writer')
+assert.ok(gMsg.content[0].text.includes('global prompt "Writer"'))
+assert.ok(gMsg.content[0].text.includes('Be concise.'))
+assert.equal(decision.messages[1], plain)
+// committed → projection keeps it; later steps do not duplicate it
+fresh.session.log.push({ type: 'user/message', data: gMsg }, { type: 'user/message', data: plain })
+fresh.session.visible.push(gMsg, plain, { role: 'assistant', content: [] })
+fresh.session.turns = 1
+decision = await preStep({ agent: fresh, step: 2, turn: 1 }, async () => ({ kind: 'enter', messages: [] }))
+assert.equal(gMsgOf(decision.messages).length, 0)
+decision = await preStep({ agent: fresh, step: 1, turn: 2 }, async () => ({ kind: 'enter', messages: [followUp] }))
+assert.deepEqual(decision.messages, [followUp])
+// compaction → the same snapshot comes back, even if the setting changed meanwhile
+await hit('global', 'POST', { enabled: false })
+fresh.session.visible = [{ role: 'user', source: { kind: 'compaction' } }]
+decision = await preStep({ agent: fresh, step: 1, turn: 3 }, async () => ({ kind: 'enter', messages: [followUp] }))
+assert.equal(decision.messages[0].content[0].text, gMsg.content[0].text)
+await hit('global', 'POST', { enabled: true })
+// conversations that already started, and subagents, are never touched
+const started = makeAgent({ turns: 3, messages: [followUp, { role: 'assistant', content: [] }] })
+decision = await preStep({ agent: started, step: 1, turn: 4 }, async () => ({ kind: 'enter', messages: [followUp] }))
+assert.deepEqual(decision.messages, [followUp])
+const compactedOld = makeAgent({ turns: 5, messages: [{ role: 'user', source: { kind: 'compaction' } }] })
+decision = await preStep({ agent: compactedOld, step: 1, turn: 6 }, async () => ({ kind: 'enter', messages: [followUp] }))
+assert.deepEqual(decision.messages, [followUp])
+const sub = makeAgent()
+sub.session.header.delegationDepth = 1
+decision = await preStep({ agent: sub, step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
+assert.deepEqual(decision.messages, [plain])
+
+// ── global prompt + `/` template: the template is appended after the global prompt
+const both = makeAgent()
+res = await run(both, ` ${id} 请审查`)
+assert.equal(res.kind, 'success', res.text)
+assert.ok(res.text.includes('Writer') && res.text.includes('代码审查'))
+const [bGlobal, bTpl, bUser] = both.inbox.nextStep
+assert.equal(bGlobal.source.kind, plugin.GLOBAL_SOURCE_KIND)
+assert.equal(bTpl.source.kind, plugin.SOURCE_KIND)
+assert.ok(bTpl.content[0].text.includes('appended after the global prompt "Writer"'))
+assert.equal(bUser.source.kind, 'user')
+decision = await preStep({ agent: both, step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [bGlobal, bTpl, bUser] }))
+assert.deepEqual(decision.messages, [bGlobal, bTpl, bUser], 'no duplicate global prompt')
+both.session.log.push(...[bGlobal, bTpl, bUser].map(data => ({ type: 'user/message', data })))
+both.session.turns = 1
+both.session.visible = [{ role: 'user', source: { kind: 'compaction' } }]
+decision = await preStep({ agent: both, step: 1, turn: 2 }, async () => ({ kind: 'enter', messages: [followUp] }))
+assert.deepEqual(decision.messages.map(m => m.source.kind), [plugin.GLOBAL_SOURCE_KIND, plugin.SOURCE_KIND, 'user'])
+
+// ── custom global prompt with a user-chosen name
+r = await hit('global', 'POST', { source: 'custom' })
+assert.equal(r.payload.global.effective, false)
+assert.ok(r.payload.global.error)
+r = await hit('global', 'POST', { customName: '   ', customContent: 'x', enabled: true })
+assert.equal(r.status, 400, 'name required')
+r = await hit('global', 'POST', { customName: '我的全局', customContent: '始终使用中文。\r\n', enabled: true })
+assert.equal(r.status, 200)
+assert.equal(r.payload.global.name, '我的全局')
+assert.equal(r.payload.global.customContent, '始终使用中文。\n')
+// saved into the template directory as <name>.md
+assert.equal(await rf(join(tplDir, '我的全局.md'), 'utf8'), '始终使用中文。\n')
+assert.equal(r.payload.global.customFile, join(tplDir, '我的全局.md'))
+assert.ok(r.payload.templates.some(t => t.file === '我的全局.md'), 'appears in the template list')
+// re-saving its own file needs no confirmation
+r = await hit('global', 'POST', { customName: '我的全局', customContent: '始终使用中文。\n请简洁。' })
+assert.equal(r.status, 200)
+assert.equal(await rf(join(tplDir, '我的全局.md'), 'utf8'), '始终使用中文。\n请简洁。')
+// another file of that name → 409 until overwrite is confirmed
+await writeFile(join(tplDir, 'other.md'), 'keep me')
+r = await hit('global', 'POST', { customName: 'other', customContent: 'W2' })
+assert.equal(r.status, 409)
+assert.deepEqual([r.payload.conflict, r.payload.file], ['file-exists', 'other.md'])
+assert.equal(await rf(join(tplDir, 'other.md'), 'utf8'), 'keep me', 'untouched')
+r = await hit('global', 'POST', { customName: 'other', customContent: 'W2', overwrite: true })
+assert.equal(r.status, 200)
+assert.equal(await rf(join(tplDir, 'other.md'), 'utf8'), 'W2')
+for (const bad of ['a/b', 'x:y', 'CON', 'end.']) {
+  r = await hit('global', 'POST', { customName: bad, customContent: 'x' })
+  assert.equal(r.status, 400, bad)
+}
+// renamed back: 我的全局.md is no longer this prompt's file, so it needs confirmation too
+r = await hit('global', 'POST', { customName: '我的全局', customContent: '始终使用中文。\n' })
+assert.equal(r.status, 409)
+r = await hit('global', 'POST', { customName: '我的全局', customContent: '始终使用中文。\n', overwrite: true })
+assert.equal(r.payload.global.name, '我的全局')
+// external edits of the file show up in the editor text and in new conversations
+await writeFile(join(tplDir, '我的全局.md'), '始终使用中文。\r\n外部修改。\r\n')
+r = await hit('state')
+assert.equal(r.payload.global.customContent, '始终使用中文。\n外部修改。\n')
+const customAgent = makeAgent()
+decision = await preStep({ agent: customAgent, step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
+assert.ok(decision.messages[0].content[0].text.includes('global prompt "我的全局"'))
+assert.ok(decision.messages[0].content[0].text.includes('外部修改。'))
+assert.equal(decision.messages[0].source.file, '我的全局.md')
+// the settings survive other edits
+r = await hit('settings', 'POST', { pinTop: true })
+assert.equal(r.payload.global.name, '我的全局')
+// disabled → new conversations are left alone
+await hit('global', 'POST', { enabled: false })
+decision = await preStep({ agent: makeAgent(), step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
+assert.deepEqual(decision.messages, [plain])
+
 await rm(root, { recursive: true, force: true })
 console.log('host smoke test: all assertions passed')

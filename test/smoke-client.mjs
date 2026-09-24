@@ -16,7 +16,8 @@ const TEMPLATES = [{ id: 'tabc', name: '代码审查', file: '代码审查.md' }
 
 let section, source, executed
 let pinTop = false
-const TEMPLATES_RESPONSE = () => ({ pinTop, templates: TEMPLATES })
+let globalInfo = { effective: false, name: '' }
+const TEMPLATES_RESPONSE = () => ({ pinTop, templates: TEMPLATES, global: globalInfo })
 globalThis.fetch = async (url) => ({ ok: true, status: 200, json: async () => (String(url).endsWith('/templates') ? TEMPLATES_RESPONSE() : {}) })
 const dict = {}
 const registered = []
@@ -65,6 +66,13 @@ assert.ok(source.matchSpace(session, '/代码审查'))
 assert.equal(source.matchSpace(session, '/plan'), undefined)
 assert.ok(await source.matchEnter(session, '/writer hello', signal, { attachments: 0 }))
 assert.equal(await source.matchEnter(session, 'hello', signal, { attachments: 0 }), undefined)
+
+// an effective global prompt is mentioned on every template row
+assert.equal(rows[0].description, '提示词模板 · 仅新对话首条消息生效')
+globalInfo = { effective: true, name: '全局规范' }
+await new Promise(r => setTimeout(r, 3100)) // menu cache TTL
+const globalRows = await source.candidates(session, { query: '', position: 'leading', signal })
+assert.equal(globalRows[0].description, '提示词模板 · 追加在全局提示词「全局规范」之后')
 
 // host refusal surfaces as a composer error (draft kept)
 commandResult = { kind: 'error', text: '只能在新对话中使用' }
