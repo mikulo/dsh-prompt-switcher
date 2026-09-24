@@ -1,0 +1,8 @@
+# personal prompt templates (never published)
+agents/
+
+node_modules/
+*.tgz
+*.log
+.DS_Store
+Thumbs.db

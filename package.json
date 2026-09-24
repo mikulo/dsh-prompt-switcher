@@ -1,0 +1,69 @@
+{
+  "name": "@mikulo/dsh-prompt-switcher",
+  "version": "1.1.0",
+  "description": "在新对话中通过 / 快速选择本地 .md 提示词模板；模板约束力等同于 AGENTS.md，并对整个对话持续生效。Pick a local .md prompt template with / when starting a new DSH conversation.",
+  "type": "module",
+  "license": "MIT",
+  "author": "mikulo",
+  "icon": "./icon.svg",
+  "homepage": "https://github.com/mikulo/dsh-prompt-switcher#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mikulo/dsh-prompt-switcher.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mikulo/dsh-prompt-switcher/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0",
+    "dsh": ">=0.1.7-alpha.1"
+  },
+  "main": "./lib/index.js",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/build.mjs --check && node test/smoke-host.mjs && node test/smoke-client.mjs"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib/index.js",
+    "lib/client.js",
+    "src",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-settings-general",
+        "@deepseek-ai/dsh-client-ui-input-trigger",
+        "@deepseek-ai/dsh-client-ui-commands",
+        "@deepseek-ai/dsh-api-remotes"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "plugin",
+    "prompt",
+    "prompt-template",
+    "agents.md"
+  ]
+}

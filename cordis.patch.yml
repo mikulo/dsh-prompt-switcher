@@ -1,0 +1,10 @@
+# dsh-prompt-switcher bundle patch.
+#
+# Inserts one dual-face plugin row: the Host half (exports ".") scans the
+# configured template directory, serves the /api/dsh-prompt-switcher routes,
+# registers one slash command per active template and binds the chosen
+# template to a brand-new conversation; the Browser half (exports "./client")
+# adds the Settings page and the Chinese-friendly `/` menu rows.
+- insert:
+    - id: prompt-switcher
+      name: '@mikulo/dsh-prompt-switcher'

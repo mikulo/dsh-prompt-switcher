@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Prompt Template Switcher",
+    "description": "Pick a local .md prompt template with / when starting a new conversation; it binds the whole conversation with AGENTS.md-level authority."
+  }
+}
