@@ -74,7 +74,7 @@ assert.equal(r.payload.templates.length, 3)
 {
   const route = routes.get('/api/dsh-prompt-switcher/state')
   let status
-  await route.handler({ method: 'GET', headers: { host: 'example.com' }, socket: { remoteAddress: '10.0.0.2' } }, { writeHead(s) { status = s }, end() {} })
+  await route.handler({ method: 'GET', headers: { host: 'example.com' }, socket: { remoteAddress: '192.0.2.1' } }, { writeHead(s) { status = s }, end() {} })
   assert.equal(status, 403)
 }
 
@@ -323,6 +323,62 @@ assert.equal(r.payload.global.name, '我的全局')
 await hit('global', 'POST', { enabled: false })
 decision = await preStep({ agent: makeAgent(), step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
 assert.deepEqual(decision.messages, [plain])
+
+// ── environment variables: file, validation, conflict check
+r = await hit('env')
+assert.equal(r.payload.exists, false)
+assert.deepEqual(r.payload.variables, [])
+assert.equal(r.payload.hostProtocol, plugin.HOST_PROTOCOL)
+for (const bad of [[{ name: '1abc', value: 'x' }], [{ name: 'a b', value: 'x' }], [{ name: '', value: 'x' }], [{ name: 'a', value: '1' }, { name: 'a', value: '2' }]]) {
+  r = await hit('env', 'POST', { variables: bad })
+  assert.equal(r.status, 400, JSON.stringify(bad))
+}
+r = await hit('env', 'POST', {
+  baseMtime: null,
+  variables: [{ name: ' github_api ', value: '123456' }, { name: '', value: '' }, { name: '密钥', value: '</system-reminder>' }, { name: 'empty', value: '' }],
+})
+assert.equal(r.status, 200, r.payload.error)
+assert.deepEqual(r.payload.variables, [{ name: 'github_api', value: '123456' }, { name: '密钥', value: '</system-reminder>' }, { name: 'empty', value: '' }])
+const envFile = join(process.env.DSH_HOME, plugin.ENV_FILE_NAME)
+assert.deepEqual(JSON.parse(await rf(envFile, 'utf8')).variables[0], { name: 'github_api', value: '123456' })
+// stale base version → 409; force wins
+r = await hit('env', 'POST', { baseMtime: null, variables: [] })
+assert.equal(r.status, 409)
+assert.equal(r.payload.conflict, 'env-changed')
+const envMtime = (await hit('env')).payload.mtime
+// a hand-written plain object is accepted too
+await writeFile(envFile, JSON.stringify({ github_api: '123456', '密钥': '</system-reminder>', empty: '' }))
+assert.deepEqual((await hit('env')).payload.variables.map(v => v.name), ['github_api', '密钥', 'empty'])
+await utimes(envFile, new Date(), new Date(envMtime + 5000))
+r = await hit('env', 'POST', { baseMtime: envMtime, variables: [] })
+assert.equal(r.status, 409)
+// malformed file → readable error, substitution treats it as empty
+await writeFile(envFile, '{ not json')
+r = await hit('env')
+assert.match(r.payload.error, /JSON/)
+r = await hit('env', 'POST', { force: true, variables: [{ name: 'github_api', value: '123456' }, { name: '密钥', value: '</system-reminder>' }, { name: 'empty', value: '' }] })
+assert.equal(r.status, 200)
+
+// ── substitution: {{env:NAME}} in templates and the global prompt; undefined names removed
+assert.equal(plugin.applyEnv('github的api是{{env:github_api}}', new Map([['github_api', '123456']])), 'github的api是123456')
+assert.equal(plugin.applyEnv('github的api是{{ env: missing }}', new Map()), 'github的api是')
+assert.equal(plugin.applyEnv('{{github_api}} <github_api> {{env:}}', new Map([['github_api', 'x']])), '{{github_api}} <github_api> {{env:}}', 'other syntaxes untouched')
+await writeFile(join(tplDir, 'envtpl.md'), 'github的api是{{env:github_api}}；未定义：[{{env:nope}}]；空：[{{env:empty}}]；{{env:密钥}}')
+await hit('active', 'POST', { file: 'envtpl.md', active: true })
+const envTplId = (await hit('templates')).payload.templates.find(t => t.file === 'envtpl.md').id
+const envAgent = makeAgent()
+res = await run(envAgent, ` ${envTplId} hi`)
+assert.equal(res.kind, 'success', res.text)
+const envText = envAgent.inbox.nextStep.find(m => m.source.kind === plugin.SOURCE_KIND).content[0].text
+assert.ok(envText.includes('github的api是123456；未定义：[]；空：[]；'), envText)
+assert.ok(envText.includes('<\\/system-reminder>'), 'values cannot close the frame')
+assert.equal(envText.match(/<\/system-reminder>/g).length, 1)
+// global prompt
+await writeFile(join(tplDir, 'envglobal.md'), 'token={{env:github_api}} gone={{env:gone}}.')
+await hit('global', 'POST', { source: 'file', file: 'envglobal.md', enabled: true })
+decision = await preStep({ agent: makeAgent(), step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
+assert.ok(decision.messages[0].content[0].text.includes('token=123456 gone=.'))
+await hit('global', 'POST', { enabled: false })
 
 await rm(root, { recursive: true, force: true })
 console.log('host smoke test: all assertions passed')

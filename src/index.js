@@ -23,6 +23,10 @@
  *   it to every brand-new top-level conversation through the same channel
  *   (source kind `prompt-switcher-global`). A template picked with `/` is
  *   appended AFTER the global prompt; it never replaces it.
+ * - Environment variables: `{{env:NAME}}` in a template or the global prompt
+ *   is replaced with the value from `$DSH_HOME/dsh-prompt-switcher.env.json`
+ *   (an undefined name is removed) when the snapshot is bound. The file can be
+ *   synced through WebDAV (push / pull / merge with per-name choices).
  *
  * Plain ESM, no dependencies: only `node:` built-ins and duck-typed Harness
  * services, so no install-time build or registry access is required.
@@ -59,7 +63,7 @@ export const COMMAND_NAME = 'prompt-template'
  * on its own, while a changed Host half needs a `dsh web` restart; the client
  * compares this value to tell the user so instead of failing obscurely.
  */
-export const HOST_PROTOCOL = 5
+export const HOST_PROTOCOL = 6
 /** HTTP route family. */
 const API = '/api/dsh-prompt-switcher'
 /** Cap on one template file (1 MiB, the same per-file cap agent-instructions uses). */
@@ -71,12 +75,16 @@ const MAX_GLOBAL_NAME = 80
 
 // ───────────────────────────────────────────────────────────── settings store
 
-/** Absolute path of the settings file. */
-function storePath() {
-  const home = process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
+/** `$DSH_HOME`, defaulting to `~/.dsh`. */
+function dshHome() {
+  return process.env.DSH_HOME && process.env.DSH_HOME.trim() !== ''
     ? process.env.DSH_HOME
     : join(homedir(), '.dsh')
-  return join(home, 'dsh-prompt-switcher.json')
+}
+
+/** Absolute path of the settings file. */
+function storePath() {
+  return join(dshHome(), 'dsh-prompt-switcher.json')
 }
 
 /**
@@ -114,6 +122,8 @@ function normalizeWebdav(raw) {
     proxyEnabled: value.proxyEnabled === true,
     proxyType: value.proxyType === 'socks5' ? 'socks5' : 'http',
     proxyAddress: text('proxyAddress').trim() || DEFAULT_PROXY_ADDRESS,
+    // Also sync the environment-variable file (off by default).
+    syncEnv: value.syncEnv === true,
   }
 }
 
@@ -137,18 +147,22 @@ async function readStore() {
 /** Serialize writes so two quick toggles cannot interleave. */
 let writeChain = Promise.resolve()
 
-/** Atomically persist the settings file (temp file + rename). */
-function writeStore(store) {
+/** Atomically write a text file (temp file + rename), serialized with every other plugin write. */
+function atomicWrite(file, text) {
   const run = async () => {
-    const file = storePath()
     await mkdir(dirname(file), { recursive: true })
     const tmp = `${file}.${process.pid}.${Date.now()}.tmp`
-    await writeFile(tmp, JSON.stringify(store, null, 2) + '\n', 'utf8')
+    await writeFile(tmp, text, 'utf8')
     await rename(tmp, file)
   }
   const next = writeChain.then(run, run)
   writeChain = next.catch(() => {})
   return next
+}
+
+/** Atomically persist the settings file. */
+function writeStore(store) {
+  return atomicWrite(storePath(), JSON.stringify(store, null, 2) + '\n')
 }
 
 // ───────────────────────────────────────────────────────────── template scan
@@ -440,15 +454,172 @@ async function loadGlobalPrompt() {
   if (!store.global.enabled) return undefined
   const read = await readGlobalContent(store.global)
   if (read.error) return { error: read.error }
+  // `{{env:NAME}}` placeholders are resolved into the snapshot the conversation binds.
+  const { map } = await loadEnvMap()
   return {
     binding: {
       name: read.name,
       file: read.file,
       origin: store.global.source,
       digest: createHash('sha1').update(read.content, 'utf8').digest('hex'),
-      text: renderGlobal(read.name, read.file, read.content),
+      text: renderGlobal(read.name, read.file, applyEnv(read.content, map)),
     },
   }
+}
+
+// ───────────────────────────────────────────────────────────── environment variables
+
+/**
+ * Environment variables: named strings that prompt templates and the global
+ * prompt reference as `{{env:NAME}}`. They live in one JSON text file,
+ * `$DSH_HOME/dsh-prompt-switcher.env.json`, shaped
+ *   { "version": 1, "variables": [ { "name": "github_api", "value": "123456" } ] }
+ * (the array keeps the user's order; a plain `{ "name": "value" }` object is
+ * also accepted when the file is edited by hand). The same file name is used
+ * at the root of the WebDAV directory.
+ */
+export const ENV_FILE_NAME = 'dsh-prompt-switcher.env.json'
+/** Valid variable name: a letter (any script) or `_`, then letters, digits, `_`, `.`, `-`. */
+const ENV_NAME_RE = /^[\p{L}_][\p{L}\p{N}_.-]*$/u
+/** `{{env:NAME}}`, spaces allowed inside the braces. */
+export const ENV_PLACEHOLDER_RE = /\{\{\s*env\s*:\s*([\p{L}_][\p{L}\p{N}_.-]*)\s*\}\}/gu
+const MAX_ENV_NAME = 64
+const MAX_ENV_VARS = 1000
+/** Cap on the whole variable file (local and remote). */
+const MAX_ENV_BYTES = 1024 * 1024
+
+function envPath() {
+  return join(dshHome(), ENV_FILE_NAME)
+}
+
+/** Why `name` cannot be a variable name, or `undefined`. */
+function invalidEnvName(name) {
+  if (typeof name !== 'string' || name === '') return '变量名不能为空。'
+  if ([...name].length > MAX_ENV_NAME) return `变量名不能超过 ${MAX_ENV_NAME} 个字符：${name}`
+  if (!ENV_NAME_RE.test(name)) return `变量名“${name}”无效：只能包含字母、汉字、数字、下划线、点和短横线，并以字母、汉字或下划线开头。`
+  return undefined
+}
+
+/**
+ * Validate a list the user saves: `[{ name, value }]`, names trimmed, unique.
+ * Rows with both fields empty are dropped.
+ */
+function normalizeEnvList(list) {
+  if (!Array.isArray(list)) throw new Error('环境变量列表格式不正确。')
+  const out = []
+  const seen = new Set()
+  for (const item of list) {
+    const name = typeof item?.name === 'string' ? item.name.trim() : ''
+    const value = typeof item?.value === 'string' ? item.value : ''
+    if (name === '' && value === '') continue
+    const problem = invalidEnvName(name)
+    if (problem) throw new Error(problem)
+    if (seen.has(name)) throw new Error(`变量名重复：${name}`)
+    seen.add(name)
+    out.push({ name, value })
+  }
+  if (out.length > MAX_ENV_VARS) throw new Error(`环境变量不能超过 ${MAX_ENV_VARS} 个。`)
+  return out
+}
+
+/**
+ * Parse the variable file text (lenient: invalid entries are skipped, a
+ * repeated name keeps its first position and its last value).
+ */
+function parseEnvText(text) {
+  let raw
+  try {
+    raw = JSON.parse(String(text).replace(/^\uFEFF/, ''))
+  } catch (error) {
+    throw new Error(`环境变量文件不是有效的 JSON：${error.message}`)
+  }
+  let entries
+  if (Array.isArray(raw?.variables)) entries = raw.variables.map(v => [v?.name, v?.value])
+  else if (raw?.variables && typeof raw.variables === 'object') entries = Object.entries(raw.variables)
+  else if (raw && typeof raw === 'object' && !Array.isArray(raw) && !('variables' in raw) && !('version' in raw)) entries = Object.entries(raw)
+  else throw new Error('环境变量文件格式不正确：缺少 variables 列表。')
+  const map = new Map()
+  for (const [name, value] of entries) {
+    if (typeof name !== 'string' || invalidEnvName(name.trim())) continue
+    map.set(name.trim(), typeof value === 'string' ? value : value == null ? '' : String(value))
+  }
+  return [...map].map(([name, value]) => ({ name, value }))
+}
+
+/** File text for a variable list. */
+function serializeEnv(variables) {
+  return JSON.stringify({ version: 1, variables: variables.map(({ name, value }) => ({ name, value })) }, null, 2) + '\n'
+}
+
+/**
+ * Read the local variable file.
+ * @returns `{ path, exists, variables, mtime, error? }` (a missing file is an empty list).
+ */
+async function readEnvFile() {
+  const path = envPath()
+  let info
+  try {
+    info = await stat(path)
+  } catch {
+    return { path, exists: false, variables: [], mtime: null }
+  }
+  if (!info.isFile()) return { path, exists: false, variables: [], mtime: null, error: `不是文件：${path}` }
+  if (info.size > MAX_ENV_BYTES) return { path, exists: true, variables: [], mtime: info.mtimeMs, error: '环境变量文件超过 1 MiB。' }
+  try {
+    const variables = parseEnvText(await readFile(path, 'utf8'))
+    return { path, exists: true, variables, mtime: info.mtimeMs }
+  } catch (error) {
+    return { path, exists: true, variables: [], mtime: info.mtimeMs, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+/** Write the local variable file atomically. */
+async function writeEnvFile(variables) {
+  const text = serializeEnv(variables)
+  if (Buffer.byteLength(text, 'utf8') > MAX_ENV_BYTES) throw new Error('环境变量内容超过 1 MiB，未保存。')
+  await atomicWrite(envPath(), text)
+  return readEnvFile()
+}
+
+/** Settings-page view of the variable file. */
+async function describeEnv() {
+  const env = await readEnvFile()
+  return { hostProtocol: HOST_PROTOCOL, fileName: ENV_FILE_NAME, ...env }
+}
+
+/**
+ * Save from the settings page. When `baseMtime` (the version the page loaded,
+ * `null` for "no file yet") no longer matches, answer 409 unless `force`.
+ */
+async function saveEnv(body) {
+  const variables = normalizeEnvList(body.variables)
+  if (body.force !== true && 'baseMtime' in body) {
+    const current = await readEnvFile()
+    const base = typeof body.baseMtime === 'number' ? body.baseMtime : null
+    const changed = base === null ? current.exists : !current.exists || Math.abs((current.mtime ?? 0) - base) > 1
+    if (changed) {
+      throw Object.assign(new Error('环境变量文件在打开后已被修改（可能来自云同步或外部编辑器）。'), {
+        status: 409,
+        payload: { conflict: 'env-changed' },
+      })
+    }
+  }
+  await writeEnvFile(variables)
+  return describeEnv()
+}
+
+/** Name → value map for substitution; an unreadable file counts as empty. */
+async function loadEnvMap() {
+  const env = await readEnvFile()
+  return { map: new Map(env.variables.map(v => [v.name, v.value])), error: env.error }
+}
+
+/**
+ * Replace every `{{env:NAME}}` with its value; an undefined name is removed.
+ * @returns the substituted text.
+ */
+export function applyEnv(text, map) {
+  return String(text).replace(ENV_PLACEHOLDER_RE, (_, name) => (map.has(name) ? map.get(name) : ''))
 }
 
 // ───────────────────────────────────────────────────────────── model message
@@ -1250,6 +1421,149 @@ async function pushFiles(store, names, overwrite) {
   return { results }
 }
 
+/** Environment-variable sync needs its switch on and a saved URL. */
+function requireEnvSync(store) {
+  if (!store.webdav.syncEnv) throw new Error('请先打开“同步环境变量文件”开关。')
+  if (!store.webdav.url) throw new Error('请先填写并保存 WebDAV 地址。')
+}
+
+/**
+ * The variable file at the root of the WebDAV directory.
+ * @returns `{ url, exists, variables, error? }`.
+ */
+async function readRemoteEnv(config) {
+  const base = parseDavUrl(config.url)
+  const url = davFileUrl(base, ENV_FILE_NAME)
+  let res
+  try {
+    res = await davRequest(config, 'GET', url, { maxBytes: MAX_ENV_BYTES })
+  } catch (error) {
+    if (error?.tooLarge) return { base, url, exists: true, variables: [], error: '云端环境变量文件超过 1 MiB。' }
+    throw error
+  }
+  if (res.status === 404) return { base, url, exists: false, variables: [] }
+  if (res.status !== 200) throw new Error(davStatusText(res.status, '读取云端环境变量文件'))
+  try {
+    return { base, url, exists: true, variables: parseEnvText(res.body.toString('utf8')) }
+  } catch (error) {
+    return { base, url, exists: true, variables: [], error: `云端${error instanceof Error ? error.message : String(error)}` }
+  }
+}
+
+/** Upload a variable list as the remote file (the directory is created when missing). */
+async function writeRemoteEnv(config, remote, variables) {
+  const listing = await listRemote(config)
+  if (listing.missing) {
+    const made = await davRequest(config, 'MKCOL', listing.base.href)
+    if (made.status !== 201 && made.status !== 405) throw new Error(davStatusText(made.status, '创建云端目录'))
+  }
+  const res = await davRequest(config, 'PUT', remote.url, {
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    body: serializeEnv(variables),
+  })
+  if (![200, 201, 204].includes(res.status)) throw new Error(davStatusText(res.status, '上传环境变量文件'))
+}
+
+/**
+ * Compare two variable lists by name.
+ * @returns `{ same, onlyLocal, onlyRemote, conflicts }` (conflicts carry both values).
+ */
+function diffEnv(localVars, remoteVars) {
+  const remote = new Map(remoteVars.map(v => [v.name, v.value]))
+  const local = new Map(localVars.map(v => [v.name, v.value]))
+  const same = []
+  const onlyLocal = []
+  const conflicts = []
+  for (const { name, value } of localVars) {
+    if (!remote.has(name)) onlyLocal.push({ name, value })
+    else if (remote.get(name) === value) same.push(name)
+    else conflicts.push({ name, local: value, remote: remote.get(name) })
+  }
+  const onlyRemote = remoteVars.filter(v => !local.has(v.name)).map(({ name, value }) => ({ name, value }))
+  return { same, onlyLocal, onlyRemote, conflicts }
+}
+
+/** Local and remote variable files side by side, for the sync panel. */
+async function compareEnv(store) {
+  requireEnvSync(store)
+  const local = await readEnvFile()
+  const remote = await readRemoteEnv(store.webdav)
+  const diff = diffEnv(local.variables, remote.variables)
+  return {
+    fileName: ENV_FILE_NAME,
+    local: { path: local.path, exists: local.exists, count: local.variables.length, error: local.error },
+    remote: { url: safeDecode(remote.url), exists: remote.exists, count: remote.variables.length, error: remote.error },
+    diff,
+    identical: local.exists && remote.exists && !local.error && !remote.error &&
+      diff.onlyLocal.length === 0 && diff.onlyRemote.length === 0 && diff.conflicts.length === 0,
+  }
+}
+
+/**
+ * Merge two lists: local order first, then remote-only names. A name whose
+ * values differ takes the side named in `choices[name]` ('local' | 'remote').
+ * @returns `{ merged }` or `{ unresolved }` (conflicts without a choice).
+ */
+function mergeEnv(localVars, remoteVars, choices) {
+  const remote = new Map(remoteVars.map(v => [v.name, v.value]))
+  const pick = choices && typeof choices === 'object' ? choices : {}
+  const merged = []
+  const unresolved = []
+  for (const { name, value } of localVars) {
+    if (!remote.has(name) || remote.get(name) === value) {
+      merged.push({ name, value })
+      continue
+    }
+    if (pick[name] === 'local') merged.push({ name, value })
+    else if (pick[name] === 'remote') merged.push({ name, value: remote.get(name) })
+    else unresolved.push({ name, local: value, remote: remote.get(name) })
+  }
+  const local = new Set(localVars.map(v => v.name))
+  for (const v of remoteVars) if (!local.has(v.name)) merged.push({ name: v.name, value: v.value })
+  return unresolved.length > 0 ? { unresolved } : { merged }
+}
+
+/**
+ * Run one environment-variable sync:
+ * - `push`  本地覆盖云端 (upload the local file);
+ * - `pull`  云端覆盖本地 (download the cloud file);
+ * - `merge` 合并配置文件 (write the merged list to both sides; conflicting
+ *   names need a choice, otherwise 409 with the conflicts).
+ * Both files are re-read here, so the result never relies on a stale listing.
+ */
+async function syncEnv(store, mode, choices) {
+  requireEnvSync(store)
+  const local = await readEnvFile()
+  const remote = await readRemoteEnv(store.webdav)
+  if (mode === 'push') {
+    if (local.error) throw new Error(local.error)
+    if (!local.exists) throw new Error('本地还没有环境变量文件，请先在“环境变量”页面添加并保存。')
+    await writeRemoteEnv(store.webdav, remote, local.variables)
+    return { mode, count: local.variables.length }
+  }
+  if (mode === 'pull') {
+    if (remote.error) throw new Error(remote.error)
+    if (!remote.exists) throw new Error('云端没有环境变量文件。')
+    await writeEnvFile(remote.variables)
+    return { mode, count: remote.variables.length }
+  }
+  if (mode === 'merge') {
+    if (local.error) throw new Error(local.error)
+    if (remote.error) throw new Error(remote.error)
+    const result = mergeEnv(local.variables, remote.variables, choices)
+    if (result.unresolved) {
+      throw Object.assign(new Error('有同名但值不同的环境变量，请为每一项选择使用云端还是本地的值。'), {
+        status: 409,
+        payload: { conflict: 'env-choices', conflicts: result.unresolved },
+      })
+    }
+    await writeEnvFile(result.merged)
+    await writeRemoteEnv(store.webdav, remote, result.merged)
+    return { mode, count: result.merged.length }
+  }
+  throw new Error('未知的同步方式。')
+}
+
 /** Apply a settings-form body onto WebDAV settings (an empty password keeps the saved one). */
 function mergeWebdav(current, body) {
   const next = { ...current }
@@ -1260,6 +1574,7 @@ function mergeWebdav(current, body) {
   if (typeof body.proxyEnabled === 'boolean') next.proxyEnabled = body.proxyEnabled
   if (body.proxyType === 'http' || body.proxyType === 'socks5') next.proxyType = body.proxyType
   if (typeof body.proxyAddress === 'string') next.proxyAddress = body.proxyAddress.trim() || DEFAULT_PROXY_ADDRESS
+  if (typeof body.syncEnv === 'boolean') next.syncEnv = body.syncEnv
   return next
 }
 
@@ -1484,11 +1799,14 @@ export function apply(ctx) {
           globalError = bound.error
         }
 
+        // `{{env:NAME}}` placeholders are resolved into the bound snapshot.
+        const { map: envMap, error: envError } = await loadEnvMap()
+        if (envError) logger?.warn?.('environment variables not applied: %s', envError)
         const binding = {
           name: template.name,
           file: template.file,
           digest: createHash('sha1').update(template.content, 'utf8').digest('hex'),
-          text: renderTemplate(template.name, template.file, template.content, global?.name),
+          text: renderTemplate(template.name, template.file, applyEnv(template.content, envMap), global?.name),
         }
         pendingBindings.set(agent.session, binding)
         // Same order as /plan: model-facing context first, then the user's own message wakes the turn.
@@ -1572,6 +1890,14 @@ export function apply(ctx) {
     route('webdav/local-list', 'POST', async () => localForPush(await readStore())),
     route('webdav/pull', 'POST', async (body) => pullFiles(await readStore(), body.files, body.overwrite)),
     route('webdav/push', 'POST', async (body) => pushFiles(await readStore(), body.files, body.overwrite)),
+    // Environment-variable file: compare both sides, then push / pull / merge.
+    route('webdav/env-compare', 'POST', async () => compareEnv(await readStore())),
+    route('webdav/env-sync', 'POST', async (body) => syncEnv(await readStore(), body.mode, body.choices)),
+    // Environment variables used as {{env:NAME}} in prompts.
+    route('env', {
+      GET: () => describeEnv(),
+      POST: (body) => saveEnv(body),
+    }),
     // Editor: full text (GET ?file=) or only its version (GET ?file=&meta=1) for change polling.
     route('file', {
       GET: async (_body, req) => {

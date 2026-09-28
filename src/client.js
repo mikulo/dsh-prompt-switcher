@@ -11,6 +11,9 @@
  *    - editor view: large monospace editor with save / discard, Ctrl+S,
  *      conflict detection, live sync with changes made in an external editor,
  *      and a "用其他程序打开…" button that shows the OS "open with" chooser.
+ *    Tabs: 提示词设置 / WebDAV 云同步 / 环境变量. The 环境变量 tab edits the
+ *    `{{env:NAME}}` variables (name + value rows); the WebDAV tab can also sync
+ *    that file (merge with per-name choices, or either side overwrites).
  * 2. A `/` input-trigger source listing the ACTIVE templates by their `.md`
  *    file name. Picking one claims the composer (`/代码审查 ` + hint); Enter
  *    submits `/prompt-template <id> <message>` to the Host, which binds the
@@ -40,7 +43,7 @@ window.__ModuleLoader__.load({
     const ORDER_UNPINNED = 100
     const POLL_MS = 2000
     /** Must equal HOST_PROTOCOL in index.js; a mismatch means `dsh web` still runs an older Host half. */
-    const HOST_PROTOCOL = 5
+    const HOST_PROTOCOL = 6
     /** Select value for a global-prompt file outside the current template folder. */
     const EXTERNAL_FILE = '\u0000external'
 
@@ -194,6 +197,78 @@ window.__ModuleLoader__.load({
       davStatusError: '失败',
       davDone: '完成',
       davRelist: '重新读取列表',
+      // environment variables
+      tabEnv: '环境变量',
+      envIntro: '定义可在提示词中引用的变量。在提示词模板或全局提示词中写 {{env:变量名}}，发送给模型前会替换为对应的值；没有定义的变量会被直接删除（替换为空）。替换发生在新对话绑定提示词时，之后修改变量只影响再之后新建的对话。',
+      envExample: '例如：变量 github_api = 123456，模板中的“github 的 api 是 {{env:github_api}}”发送时变为“github 的 api 是 123456”。',
+      envListTitle: '变量（{count}）',
+      envName: '变量名',
+      envValue: '值',
+      envNamePlaceholder: '变量名，如 github_api',
+      envValuePlaceholder: '对应的字符串',
+      envAdd: '新增变量',
+      envDelete: '删除',
+      envDeleteAria: '删除变量 {name}',
+      envCopy: '复制引用',
+      envCopied: '已复制 {ref}',
+      envEmpty: '还没有环境变量，点击“新增变量”添加。',
+      envSave: '保存',
+      envSaving: '保存中…',
+      envDiscard: '放弃修改',
+      envReload: '重新读取',
+      envDirty: '未保存',
+      envSaved: '已保存',
+      envSavedAt: '已保存（{time}）',
+      envFile: '保存位置：{path}',
+      envNameRequired: '请填写变量名',
+      envNameInvalid: '只能包含字母、汉字、数字、_ . -，并以字母、汉字或 _ 开头',
+      envNameDuplicate: '变量名重复',
+      envFixErrors: '请先修正标红的变量名。',
+      envConflict: '环境变量文件在打开后已被修改（可能来自云同步或外部编辑器）。\n\n是否用当前页面的内容覆盖？',
+      envRestored: '已恢复上次未保存的修改。',
+      envFileError: '环境变量文件读取失败：{error}（保存会用页面内容重写该文件）',
+      envConfirmDiscard: '确定放弃所有未保存的修改吗？',
+      // environment-variable WebDAV sync
+      davEnvTitle: '同步环境变量文件',
+      davEnvDesc: '开启后可在本地和云端之间同步环境变量文件（{file}，位于 WebDAV 目录根目录）。',
+      davEnvOpen: '同步环境变量…',
+      davEnvPanel: '同步环境变量文件',
+      davEnvLocal: '本地：{path}',
+      davEnvRemote: '云端：{url}',
+      davEnvLocalCount: '本地 {count} 个变量',
+      davEnvRemoteCount: '云端 {count} 个变量',
+      davEnvLocalMissing: '本地还没有环境变量文件',
+      davEnvRemoteMissing: '云端还没有环境变量文件',
+      davEnvIdentical: '本地与云端的环境变量完全一致，无需同步。',
+      davEnvSame: '相同 {count} 个',
+      davEnvOnlyLocal: '仅本地 {count} 个：{names}',
+      davEnvOnlyRemote: '仅云端 {count} 个：{names}',
+      davEnvConflicts: '同名但值不同 {count} 个',
+      davEnvMode: '同步方式',
+      davEnvMerge: '合并配置文件',
+      davEnvMergeDesc: '两边的变量合并成一份，同时写入本地和云端。同名且值相同的合并为一条，值不同的由你逐个选择。',
+      davEnvPush: '本地覆盖云端',
+      davEnvPushDesc: '用本地文件替换云端文件。',
+      davEnvPull: '云端覆盖本地',
+      davEnvPullDesc: '用云端文件替换本地文件。',
+      davEnvUpload: '上传到云端',
+      davEnvUploadDesc: '云端还没有环境变量文件，将上传本地文件。',
+      davEnvDownload: '下载到本地',
+      davEnvDownloadDesc: '本地还没有环境变量文件，将下载云端文件。',
+      davEnvNothing: '本地和云端都没有环境变量文件。',
+      davEnvChoose: '以下变量名相同但值不同，请选择要使用的值：',
+      davEnvUseLocal: '本地',
+      davEnvUseRemote: '云端',
+      davEnvAllLocal: '全部使用本地',
+      davEnvAllRemote: '全部使用云端',
+      davEnvEmptyValue: '（空）',
+      davEnvChosen: '已选择 {count} / {total}',
+      davEnvRun: '开始同步（{mode}）',
+      davEnvRunning: '同步中…',
+      davEnvLosePush: '云端独有的 {count} 个变量（{names}）将会丢失，确定用本地覆盖云端吗？',
+      davEnvLosePull: '本地独有的 {count} 个变量（{names}）将会丢失，确定用云端覆盖本地吗？',
+      davEnvDone: '同步完成：{mode}，共 {count} 个变量。',
+      davEnvRecompare: '重新比较',
     }
     const en = {
       nav: 'Prompt templates',
@@ -341,6 +416,76 @@ window.__ModuleLoader__.load({
       davStatusError: 'Failed',
       davDone: 'Done',
       davRelist: 'Reload list',
+      tabEnv: 'Variables',
+      envIntro: 'Define variables that prompts can reference. Write {{env:NAME}} in a prompt template or the global prompt and it is replaced with the value before the prompt reaches the model; an undefined name is removed. Substitution happens when a new conversation binds the prompt, so later edits only affect conversations started afterwards.',
+      envExample: 'Example: with github_api = 123456, "the github api is {{env:github_api}}" is sent as "the github api is 123456".',
+      envListTitle: 'Variables ({count})',
+      envName: 'Name',
+      envValue: 'Value',
+      envNamePlaceholder: 'Name, e.g. github_api',
+      envValuePlaceholder: 'Value',
+      envAdd: 'Add variable',
+      envDelete: 'Delete',
+      envDeleteAria: 'Delete variable {name}',
+      envCopy: 'Copy reference',
+      envCopied: 'Copied {ref}',
+      envEmpty: 'No variables yet; click "Add variable".',
+      envSave: 'Save',
+      envSaving: 'Saving…',
+      envDiscard: 'Discard changes',
+      envReload: 'Reload',
+      envDirty: 'Unsaved',
+      envSaved: 'Saved',
+      envSavedAt: 'Saved ({time})',
+      envFile: 'Stored in: {path}',
+      envNameRequired: 'Name required',
+      envNameInvalid: 'Letters, digits, _ . - only, starting with a letter or _',
+      envNameDuplicate: 'Duplicate name',
+      envFixErrors: 'Fix the names marked in red first.',
+      envConflict: 'The variable file changed after it was opened (WebDAV sync or an external editor).\n\nOverwrite it with this page?',
+      envRestored: 'Restored your unsaved edits.',
+      envFileError: 'Could not read the variable file: {error} (saving rewrites it with this page)',
+      envConfirmDiscard: 'Discard all unsaved changes?',
+      davEnvTitle: 'Sync the variable file',
+      davEnvDesc: 'When on, the environment-variable file ({file}, at the root of the WebDAV folder) can be synced.',
+      davEnvOpen: 'Sync variables…',
+      davEnvPanel: 'Sync the variable file',
+      davEnvLocal: 'Local: {path}',
+      davEnvRemote: 'Cloud: {url}',
+      davEnvLocalCount: '{count} local variables',
+      davEnvRemoteCount: '{count} cloud variables',
+      davEnvLocalMissing: 'No local variable file yet',
+      davEnvRemoteMissing: 'No cloud variable file yet',
+      davEnvIdentical: 'Local and cloud variables are identical; nothing to sync.',
+      davEnvSame: '{count} identical',
+      davEnvOnlyLocal: '{count} local only: {names}',
+      davEnvOnlyRemote: '{count} cloud only: {names}',
+      davEnvConflicts: '{count} with different values',
+      davEnvMode: 'Mode',
+      davEnvMerge: 'Merge files',
+      davEnvMergeDesc: 'Combine both sides into one list written locally and to the cloud. Same name and value become one entry; you choose for names whose values differ.',
+      davEnvPush: 'Local overwrites cloud',
+      davEnvPushDesc: 'Replace the cloud file with the local file.',
+      davEnvPull: 'Cloud overwrites local',
+      davEnvPullDesc: 'Replace the local file with the cloud file.',
+      davEnvUpload: 'Upload to cloud',
+      davEnvUploadDesc: 'There is no cloud variable file yet; the local file is uploaded.',
+      davEnvDownload: 'Download to local',
+      davEnvDownloadDesc: 'There is no local variable file yet; the cloud file is downloaded.',
+      davEnvNothing: 'Neither side has a variable file.',
+      davEnvChoose: 'These names have different values; choose which one to keep:',
+      davEnvUseLocal: 'Local',
+      davEnvUseRemote: 'Cloud',
+      davEnvAllLocal: 'Use all local',
+      davEnvAllRemote: 'Use all cloud',
+      davEnvEmptyValue: '(empty)',
+      davEnvChosen: '{count} / {total} chosen',
+      davEnvRun: 'Sync ({mode})',
+      davEnvRunning: 'Syncing…',
+      davEnvLosePush: '{count} cloud-only variables ({names}) will be lost. Overwrite the cloud file with the local one?',
+      davEnvLosePull: '{count} local-only variables ({names}) will be lost. Overwrite the local file with the cloud one?',
+      davEnvDone: 'Sync finished: {mode}, {count} variables.',
+      davEnvRecompare: 'Compare again',
     }
 
     // ─────────────────────────────────────────────── Host API
@@ -409,7 +554,7 @@ window.__ModuleLoader__.load({
       return promise
     }
 
-    /** Last settings tab shown ('prompts' | 'webdav'), kept per page load. */
+    /** Last settings tab shown ('prompts' | 'webdav' | 'env'), kept per page load. */
     let lastTab = 'prompts'
 
     /** Unsaved editor drafts survive closing the Settings dialog (per page load). */
@@ -911,6 +1056,377 @@ window.__ModuleLoader__.load({
           error ? h('p', { style: styles.error, role: 'alert' }, error) : null))
     }
 
+    // ─────────────────────────────────────────────── environment variables view
+
+    /** Same rule as the Host: a letter (any script) or `_`, then letters, digits, `_`, `.`, `-`. */
+    const ENV_NAME_RE = /^[\p{L}_][\p{L}\p{N}_.-]*$/u
+    const envRef = (name) => `{{env:${name}}}`
+    /** Unsaved variable edits survive tab switches and closing the dialog (per page load). */
+    let envDraft // { rows, baseMtime }
+    let envRowKey = 0
+    const envRows = (variables) => (variables ?? []).map(v => ({ key: ++envRowKey, name: v.name, value: v.value }))
+    /** Comparable form of a list (blank rows ignored, names trimmed). */
+    const envSignature = (list) => JSON.stringify((list ?? [])
+      .filter(r => r.name.trim() !== '' || r.value !== '')
+      .map(r => [r.name.trim(), r.value]))
+    /** Per-row locale key of the name problem, if any. */
+    function envRowErrors(rows) {
+      const counts = new Map()
+      for (const r of rows) {
+        const name = r.name.trim()
+        if (name !== '') counts.set(name, (counts.get(name) ?? 0) + 1)
+      }
+      return rows.map((r) => {
+        const name = r.name.trim()
+        if (name === '') return r.value === '' ? undefined : 'envNameRequired'
+        if ([...name].length > 64 || !ENV_NAME_RE.test(name)) return 'envNameInvalid'
+        if (counts.get(name) > 1) return 'envNameDuplicate'
+        return undefined
+      })
+    }
+
+    /** The “环境变量” tab: one row per variable (name + value), add / edit / delete, save. */
+    function EnvView({ t }) {
+      const [file, setFile] = useState(undefined) // Host answer: { path, exists, variables, mtime, error? }
+      const [rows, setRows] = useState([])
+      const [baseMtime, setBaseMtime] = useState(null)
+      const [busy, setBusy] = useState(undefined) // 'load' | 'save'
+      const [notice, setNotice] = useState(undefined) // { tone, text }
+      const [focusKey, setFocusKey] = useState(undefined)
+      const alive = useRef(true)
+      const fileRef = useRef(file)
+      const rowsRef = useRef(rows)
+      const baseRef = useRef(baseMtime)
+      fileRef.current = file
+      rowsRef.current = rows
+      baseRef.current = baseMtime
+      useEffect(() => () => { alive.current = false }, [])
+      // Keep unsaved edits when the tab changes or the dialog closes.
+      useEffect(() => () => {
+        const current = fileRef.current
+        envDraft = current && envSignature(rowsRef.current) !== envSignature(current.variables)
+          ? { rows: rowsRef.current, baseMtime: baseRef.current }
+          : undefined
+      }, [])
+
+      const adopt = useCallback((value) => {
+        setFile(value)
+        setRows(envRows(value.variables))
+        setBaseMtime(value.mtime ?? null)
+      }, [])
+
+      const load = useCallback(async (restore) => {
+        setBusy('load')
+        try {
+          const value = await call('env')
+          if (!alive.current) return
+          if (restore && envDraft) {
+            setFile(value)
+            setRows(envDraft.rows)
+            setBaseMtime(envDraft.baseMtime)
+            envDraft = undefined
+            setNotice({ tone: 'info', text: t('envRestored') })
+          } else {
+            adopt(value)
+          }
+        } catch (cause) {
+          if (alive.current) setNotice({ tone: 'error', text: errorText(cause) })
+        } finally {
+          if (alive.current) setBusy(undefined)
+        }
+      }, [adopt, t])
+
+      useEffect(() => { load(true) }, [load])
+
+      if (!file) {
+        return notice
+          ? h('p', { style: styles.error, role: 'alert' }, notice.text)
+          : h('p', { style: styles.empty }, t('loading'))
+      }
+
+      const dirty = envSignature(rows) !== envSignature(file.variables)
+      const errors = envRowErrors(rows)
+      const hasErrors = errors.some(Boolean)
+      const count = rows.filter(r => r.name.trim() !== '').length
+
+      const updateRow = (key, patch) => setRows(prev => prev.map(r => (r.key === key ? { ...r, ...patch } : r)))
+      const removeRow = (key) => setRows(prev => prev.filter(r => r.key !== key))
+      const addRow = () => {
+        const key = ++envRowKey
+        setRows(prev => [...prev, { key, name: '', value: '' }])
+        setFocusKey(key)
+      }
+      const copy = (name) => {
+        const ref = envRef(name)
+        Promise.resolve(navigator.clipboard?.writeText(ref)).then(
+          () => { if (alive.current) setNotice({ tone: 'ok', text: t('envCopied', { ref }) }) },
+          (cause) => { if (alive.current) setNotice({ tone: 'error', text: errorText(cause) }) },
+        )
+      }
+      const save = async () => {
+        if (busy || !dirty) return
+        if (hasErrors) {
+          setNotice({ tone: 'error', text: t('envFixErrors') })
+          return
+        }
+        setBusy('save')
+        setNotice(undefined)
+        const body = { variables: rows.map(r => ({ name: r.name.trim(), value: r.value })), baseMtime }
+        try {
+          let value
+          try {
+            value = await call('env', body)
+          } catch (cause) {
+            // Changed on disk since it was loaded (e.g. by a WebDAV pull): ask first.
+            if (cause?.status !== 409) throw cause
+            if (!window.confirm(t('envConflict'))) return
+            value = await call('env', { ...body, force: true })
+          }
+          if (!alive.current) return
+          adopt(value)
+          setNotice({ tone: 'info', text: t('envSavedAt', { time: new Date().toLocaleTimeString() }) })
+        } catch (cause) {
+          if (alive.current) setNotice({ tone: 'error', text: errorText(cause) })
+        } finally {
+          if (alive.current) setBusy(undefined)
+        }
+      }
+      const discard = () => {
+        if (dirty && !window.confirm(t('envConfirmDiscard'))) return
+        adopt(file)
+        setNotice(undefined)
+      }
+      const reload = () => {
+        if (dirty && !window.confirm(t('envConfirmDiscard'))) return
+        setNotice(undefined)
+        load(false)
+      }
+      const onKeyDown = (event) => {
+        if ((event.ctrlKey || event.metaKey) && !event.altKey && event.key.toLowerCase() === 's') {
+          event.preventDefault()
+          save()
+        }
+      }
+
+      const nameWidth = { flex: '0 0 34%', minWidth: 0 }
+      const rowStyle = { display: 'flex', alignItems: 'center', gap: 8 }
+      const list = rows.length === 0
+        ? h('div', { style: styles.globalRow }, h('p', { style: styles.empty }, t('envEmpty')))
+        : h('ul', { style: { listStyle: 'none', margin: 0, padding: 0 } },
+          h('li', { key: 'head', style: { ...rowStyle, padding: '8px 14px 0' } },
+            h('span', { style: { ...styles.muted, ...nameWidth } }, t('envName')),
+            h('span', { style: { ...styles.muted, flex: 1 } }, t('envValue'))),
+          rows.map((row, index) => {
+            const problem = errors[index]
+            const name = row.name.trim()
+            return h('li', { key: row.key, style: { display: 'flex', flexDirection: 'column', gap: 4, padding: '8px 14px' } },
+              h('div', { style: rowStyle },
+                h('div', { style: nameWidth },
+                  h(Input, {
+                    value: row.name,
+                    placeholder: t('envNamePlaceholder'),
+                    spellCheck: false,
+                    autoComplete: 'off',
+                    autoFocus: row.key === focusKey,
+                    'aria-invalid': problem ? true : undefined,
+                    'aria-label': t('envName'),
+                    disabled: busy === 'save',
+                    onChange: (event) => updateRow(row.key, { name: event.target.value }),
+                    style: { width: '100%' },
+                  })),
+                h('div', { style: { flex: 1, minWidth: 0 } },
+                  h(Input, {
+                    value: row.value,
+                    placeholder: t('envValuePlaceholder'),
+                    spellCheck: false,
+                    autoComplete: 'off',
+                    'aria-label': t('envValue'),
+                    disabled: busy === 'save',
+                    onChange: (event) => updateRow(row.key, { value: event.target.value }),
+                    style: { width: '100%' },
+                  })),
+                h(Button, {
+                  variant: 'ghost',
+                  size: 'sm',
+                  disabled: name === '' || Boolean(problem),
+                  title: name && !problem ? envRef(name) : undefined,
+                  onClick: () => copy(name),
+                }, t('envCopy')),
+                h(Button, {
+                  variant: 'ghost',
+                  size: 'sm',
+                  disabled: busy === 'save',
+                  'aria-label': t('envDeleteAria', { name }),
+                  onClick: () => removeRow(row.key),
+                }, t('envDelete'))),
+              problem ? h('span', { style: { ...styles.error, fontSize: 12 } }, t(problem)) : null)
+          }))
+
+      return h('div', { style: styles.section, onKeyDown },
+        h('p', { style: styles.intro }, t('envIntro')),
+        h('p', { style: styles.intro }, t('envExample')),
+        file.error ? h('div', { style: styles.banner('error'), role: 'alert' },
+          h('span', { style: styles.bannerText }, t('envFileError', { error: file.error }))) : null,
+        h('div', { style: styles.listHead },
+          h('h3', { style: { ...styles.groupTitle, margin: 0 } }, t('envListTitle', { count })),
+          h('div', { style: styles.toolbar },
+            h(Button, { variant: 'outline', size: 'sm', disabled: busy !== undefined, onClick: reload }, t('envReload')),
+            h(Button, { variant: 'outline', size: 'sm', disabled: busy === 'save', onClick: addRow }, `+ ${t('envAdd')}`))),
+        h('div', { style: styles.card }, list),
+        h('div', { style: styles.actions },
+          h('span', { style: styles.status(dirty) }, dirty ? t('envDirty') : t('envSaved')),
+          h('span', { style: { ...styles.path, flex: 1 }, title: file.path }, t('envFile', { path: file.path })),
+          h(Button, { variant: 'outline', disabled: !dirty || busy !== undefined, onClick: discard }, t('envDiscard')),
+          h(Button, { variant: 'primary', disabled: !dirty || hasErrors || busy !== undefined, onClick: save },
+            busy === 'save' ? t('envSaving') : t('envSave'))),
+        notice ? h('div', { style: styles.banner(notice.tone), role: notice.tone === 'error' ? 'alert' : 'status' },
+          h('span', { style: styles.bannerText }, notice.text)) : null)
+    }
+
+    /**
+     * Environment-variable file sync: shows how the two files differ and runs
+     * 合并配置文件 / 本地覆盖云端 / 云端覆盖本地 (or plain upload / download when
+     * one side has no file). Merging asks for every name whose values differ.
+     */
+    function EnvSyncPanel({ t, compare, onClose, onReload }) {
+      const { local, remote, diff } = compare
+      const localOk = local.exists && !local.error
+      const remoteOk = remote.exists && !remote.error
+      const canMerge = localOk && remoteOk
+      const canPush = localOk
+      const canPull = remoteOk
+      const pushLabel = remote.exists ? t('davEnvPush') : t('davEnvUpload')
+      const pullLabel = local.exists ? t('davEnvPull') : t('davEnvDownload')
+      const modes = [
+        canMerge ? { value: 'merge', label: t('davEnvMerge'), desc: t('davEnvMergeDesc') } : null,
+        canPush ? { value: 'push', label: pushLabel, desc: remote.exists ? t('davEnvPushDesc') : t('davEnvUploadDesc') } : null,
+        canPull ? { value: 'pull', label: pullLabel, desc: local.exists ? t('davEnvPullDesc') : t('davEnvDownloadDesc') } : null,
+      ].filter(Boolean)
+      const [mode, setMode] = useState(() => modes[0]?.value)
+      const [conflicts, setConflicts] = useState(() => diff.conflicts)
+      const [choices, setChoices] = useState({})
+      const [running, setRunning] = useState(false)
+      const [result, setResult] = useState(undefined)
+      const [error, setError] = useState(undefined)
+      const alive = useRef(true)
+      useEffect(() => () => { alive.current = false }, [])
+
+      const current = modes.find(m => m.value === mode)
+      const names = (list) => list.map(v => v.name).join('、')
+      const chosen = conflicts.filter(c => choices[c.name] === 'local' || choices[c.name] === 'remote').length
+      const needChoices = mode === 'merge' && chosen < conflicts.length
+      const chooseAll = (side) => setChoices(Object.fromEntries(conflicts.map(c => [c.name, side])))
+
+      const run = async () => {
+        if (!current) return
+        if (mode === 'push' && remote.exists && diff.onlyRemote.length > 0 &&
+          !window.confirm(t('davEnvLosePush', { count: diff.onlyRemote.length, names: names(diff.onlyRemote) }))) return
+        if (mode === 'pull' && local.exists && diff.onlyLocal.length > 0 &&
+          !window.confirm(t('davEnvLosePull', { count: diff.onlyLocal.length, names: names(diff.onlyLocal) }))) return
+        setRunning(true)
+        setError(undefined)
+        try {
+          const value = await call('webdav/env-sync', { mode, choices })
+          if (alive.current) setResult({ ...value, label: current.label })
+        } catch (cause) {
+          if (!alive.current) return
+          // The files changed since the comparison: show the current conflicts.
+          if (cause?.status === 409 && Array.isArray(cause.payload?.conflicts)) setConflicts(cause.payload.conflicts)
+          setError(errorText(cause))
+        } finally {
+          if (alive.current) setRunning(false)
+        }
+      }
+
+      const valueText = (value) => (value === '' ? t('davEnvEmptyValue') : value)
+      const monoValue = {
+        flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 13,
+        fontFamily: 'var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace)',
+      }
+      const side = (c, which) => h('label', { style: { ...styles.checkRow, flex: 'none', width: '100%' }, title: which === 'local' ? c.local : c.remote },
+        h('input', {
+          type: 'radio',
+          name: `env-choice-${c.name}`,
+          checked: choices[c.name] === which,
+          disabled: running,
+          onChange: () => setChoices(prev => ({ ...prev, [c.name]: which })),
+          style: styles.checkbox,
+        }),
+        h('span', { style: { ...styles.tag, marginLeft: 0, flex: 'none' } }, which === 'local' ? t('davEnvUseLocal') : t('davEnvUseRemote')),
+        h('span', { style: monoValue }, valueText(which === 'local' ? c.local : c.remote)))
+
+      let content
+      if (result) {
+        content = h('div', { style: styles.globalBody },
+          h('div', { style: styles.banner('ok'), role: 'status' },
+            h('span', { style: styles.bannerText }, t('davEnvDone', { mode: result.label, count: result.count }))),
+          h('div', { style: styles.actions },
+            h(Button, { variant: 'outline', size: 'sm', onClick: onReload }, t('davEnvRecompare')),
+            h(Button, { variant: 'primary', size: 'sm', onClick: onClose }, t('davDone'))))
+      } else {
+        const summary = [
+          h('span', { key: 'l', style: local.error ? styles.error : styles.muted },
+            local.error ?? (local.exists ? t('davEnvLocalCount', { count: local.count }) : t('davEnvLocalMissing'))),
+          h('span', { key: 'r', style: remote.error ? styles.error : styles.muted },
+            remote.error ?? (remote.exists ? t('davEnvRemoteCount', { count: remote.count }) : t('davEnvRemoteMissing'))),
+        ]
+        const details = canMerge && !compare.identical
+          ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+            h('span', { style: styles.muted }, t('davEnvSame', { count: diff.same.length })),
+            diff.onlyLocal.length ? h('span', { style: styles.muted }, t('davEnvOnlyLocal', { count: diff.onlyLocal.length, names: names(diff.onlyLocal) })) : null,
+            diff.onlyRemote.length ? h('span', { style: styles.muted }, t('davEnvOnlyRemote', { count: diff.onlyRemote.length, names: names(diff.onlyRemote) })) : null,
+            diff.conflicts.length ? h('span', { style: { ...styles.muted, color: 'var(--dsw-alias-state-warning-primary, #b26a00)' } }, t('davEnvConflicts', { count: diff.conflicts.length })) : null)
+          : null
+
+        let body
+        if (compare.identical) {
+          body = h('p', { style: styles.notice }, t('davEnvIdentical'))
+        } else if (modes.length === 0) {
+          body = h('p', { style: styles.notice }, t('davEnvNothing'))
+        } else {
+          body = h('div', { style: styles.globalBody },
+            h(Field, { label: t('davEnvMode') },
+              h(Segmented, { value: mode, options: modes, disabled: running, onChange: (next) => { setMode(next); setError(undefined) } }),
+              current ? h('span', { style: styles.muted }, current.desc) : null),
+            mode === 'merge' && conflicts.length > 0
+              ? h('div', { style: styles.globalBody },
+                h('div', { style: styles.listHead },
+                  h('span', { style: { fontSize: 13 } }, t('davEnvChoose')),
+                  h('div', { style: styles.toolbar },
+                    h('span', { style: styles.muted }, t('davEnvChosen', { count: chosen, total: conflicts.length })),
+                    h(Button, { variant: 'outline', size: 'sm', disabled: running, onClick: () => chooseAll('local') }, t('davEnvAllLocal')),
+                    h(Button, { variant: 'outline', size: 'sm', disabled: running, onClick: () => chooseAll('remote') }, t('davEnvAllRemote')))),
+                h('ul', { style: { ...styles.list, maxHeight: 360, overflowY: 'auto' } }, conflicts.map((c, index) => h('li', {
+                  key: c.name,
+                  style: { ...(index === 0 ? { ...styles.item, ...styles.itemFirst } : styles.item), flexDirection: 'column', alignItems: 'stretch', gap: 6 },
+                },
+                h('span', { style: { ...styles.itemName, fontWeight: 600 }, title: envRef(c.name) }, c.name),
+                side(c, 'remote'),
+                side(c, 'local')))))
+              : null)
+        }
+
+        content = h('div', { style: styles.globalBody },
+          ...summary,
+          details,
+          body,
+          error ? h('p', { style: styles.error, role: 'alert' }, error) : null,
+          h('div', { style: styles.actions },
+            h(Button, { variant: 'outline', size: 'sm', disabled: running, onClick: onClose }, t('davCancel')),
+            compare.identical || modes.length === 0
+              ? h(Button, { variant: 'outline', size: 'sm', disabled: running, onClick: onReload }, t('davEnvRecompare'))
+              : h(Button, { variant: 'primary', size: 'sm', disabled: running || !current || needChoices, onClick: run },
+                running ? t('davEnvRunning') : t('davEnvRun', { mode: current?.label ?? '' }))))
+      }
+
+      return h('div', { style: styles.card },
+        h('div', { style: { ...styles.globalRow, gap: 2 } },
+          h('span', { style: { fontSize: 14, fontWeight: 600 } }, t('davEnvPanel')),
+          h('span', { style: styles.path, title: local.path }, t('davEnvLocal', { path: local.path })),
+          h('span', { style: styles.path, title: remote.url }, t('davEnvRemote', { url: remote.url }))),
+        h('div', { style: { ...styles.globalRow, borderTop: border } }, content))
+    }
+
     // ─────────────────────────────────────────────── WebDAV sync view
 
     const formFrom = (webdav) => ({
@@ -1105,6 +1621,7 @@ window.__ModuleLoader__.load({
       const [notice, setNotice] = useState(undefined) // { tone, text }
       const [test, setTest] = useState(undefined) // { ok, warning?, message }
       const [sync, setSync] = useState(undefined) // { mode, listing, key }
+      const [envSync, setEnvSync] = useState(undefined) // { compare, key }
       const alive = useRef(true)
       useEffect(() => () => { alive.current = false }, [])
 
@@ -1159,7 +1676,20 @@ window.__ModuleLoader__.load({
         if (alive.current) setSync({ mode, listing, key: Date.now() })
       })
 
+      // The switch is saved on its own; unsaved form edits stay in the form.
+      const toggleSyncEnv = (next) => task('env-toggle', async () => {
+        const value = await call('webdav', { syncEnv: next })
+        if (!alive.current) return
+        setInfo({ directory: value.directory, webdav: value.webdav })
+        if (!next) setEnvSync(undefined)
+      })
+      const openEnvSync = () => task('env', async () => {
+        const compare = await call('webdav/env-compare', {})
+        if (alive.current) setEnvSync({ compare, key: Date.now() })
+      })
+
       const blocked = !webdav.url ? t('davNeedUrl') : dirty ? t('davNeedSave') : !info.directory ? t('davNeedDir') : undefined
+      const envBlocked = !webdav.url ? t('davNeedUrl') : dirty ? t('davNeedSave') : undefined
       const locked = busy !== undefined
 
       const testBanner = test
@@ -1270,7 +1800,35 @@ window.__ModuleLoader__.load({
                 h('span', { style: styles.muted }, t('davPushDesc'))),
               h(Button, { variant: 'outline', disabled: locked || blocked !== undefined, title: blocked, onClick: () => openSync('push') },
                 busy === 'push' ? t('davListing') : t('davPush'))),
-            blocked ? h('div', { style: { ...styles.globalRow, borderTop: border } }, h('span', { style: styles.muted }, blocked)) : null))
+            blocked ? h('div', { style: { ...styles.globalRow, borderTop: border } }, h('span', { style: styles.muted }, blocked)) : null),
+
+        // Environment-variable file (same WebDAV folder root).
+        h('div', { style: styles.card },
+          h('div', { style: styles.optionRow },
+            h('div', { style: styles.itemText },
+              h('span', { style: { fontSize: 14 } }, t('davEnvTitle')),
+              h('span', { style: styles.muted }, t('davEnvDesc', { file: 'dsh-prompt-switcher.env.json' }))),
+            h(Switch, {
+              checked: webdav.syncEnv === true,
+              disabled: locked,
+              label: t('davEnvTitle'),
+              onChange: toggleSyncEnv,
+            })),
+          webdav.syncEnv && !envSync
+            ? h('div', { style: { ...styles.optionRow, borderTop: border } },
+              h('span', { style: { ...styles.muted, flex: 1 } }, envBlocked ?? ''),
+              h(Button, { variant: 'outline', disabled: locked || envBlocked !== undefined, title: envBlocked, onClick: openEnvSync },
+                busy === 'env' ? t('davListing') : t('davEnvOpen')))
+            : null),
+        webdav.syncEnv && envSync
+          ? h(EnvSyncPanel, {
+            key: envSync.key,
+            t,
+            compare: envSync.compare,
+            onClose: () => setEnvSync(undefined),
+            onReload: openEnvSync,
+          })
+          : null)
     }
 
     // ─────────────────────────────────────────────── list view + page
@@ -1388,7 +1946,7 @@ window.__ModuleLoader__.load({
           h('h2', { key: 'title', style: styles.heading }, t('title'), h('span', { style: { ...styles.muted, fontWeight: 400, marginLeft: 8 } }, `v${VERSION}`)),
           hostOutdated ? h('div', { key: 'outdated', style: styles.banner('error'), role: 'alert' }, h('span', { style: styles.bannerText }, t('hostOutdated'))) : null,
           h('div', { key: 'tabs', style: styles.tabs, role: 'tablist' },
-            [['prompts', t('tabPrompts')], ['webdav', t('tabWebdav')]].map(([id, label]) => h('button', {
+            [['prompts', t('tabPrompts')], ['webdav', t('tabWebdav')], ['env', t('tabEnv')]].map(([id, label]) => h('button', {
               key: id,
               type: 'button',
               role: 'tab',
@@ -1397,6 +1955,10 @@ window.__ModuleLoader__.load({
               onClick: () => setTab(id),
             }, label))),
         ]
+
+        if (tab === 'env') {
+          return h('div', { style: styles.section }, ...header, h(EnvView, { t }))
+        }
 
         if (tab === 'webdav') {
           return h('div', { style: styles.section },

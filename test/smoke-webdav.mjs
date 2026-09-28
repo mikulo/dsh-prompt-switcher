@@ -230,6 +230,71 @@ assert.match(r.payload.message, /主机:端口/)
 r = await hit('webdav', { proxyAddress: '' })
 assert.equal(r.payload.webdav.proxyAddress, '127.0.0.1:7891', 'empty address falls back to the default')
 
+// ── environment-variable file sync
+await hit('webdav', { proxyEnabled: false })
+const ENV = DIR + 'dsh-prompt-switcher.env.json'
+const envOf = (buf) => JSON.parse(buf.toString()).variables
+r = await hit('webdav/env-compare', {})
+assert.equal(r.status, 400, 'switch off by default')
+r = await hit('webdav', { syncEnv: true })
+assert.equal(r.payload.webdav.syncEnv, true)
+assert.equal(r.payload.webdav.url, url, 'switch alone keeps the other settings')
+// nothing on either side
+r = await hit('webdav/env-compare', {})
+assert.equal(r.status, 200, r.payload.error)
+assert.deepEqual([r.payload.local.exists, r.payload.remote.exists], [false, false])
+assert.equal(r.payload.remote.url, url + 'dsh-prompt-switcher.env.json')
+r = await hit('webdav/env-sync', { mode: 'push' })
+assert.equal(r.status, 400, 'no local file to push')
+// upload (cloud missing)
+await hit('env', { variables: [{ name: 'github_api', value: 'local-1' }, { name: 'only_local', value: 'L' }, { name: 'same', value: 'S' }] })
+r = await hit('webdav/env-sync', { mode: 'push' })
+assert.equal(r.status, 200, r.payload.error)
+assert.equal(r.payload.count, 3)
+assert.deepEqual(envOf(files.get(ENV)).map(v => v.name), ['github_api', 'only_local', 'same'])
+// the env file never shows up as a template
+r = await hit('webdav/remote-list', {})
+assert.ok(!r.payload.files.some(f => f.name.endsWith('.json')))
+// both sides exist with differences
+files.set(ENV, Buffer.from(JSON.stringify({ version: 1, variables: [
+  { name: 'same', value: 'S' }, { name: 'github_api', value: 'cloud-1' }, { name: 'only_remote', value: 'R' },
+] })))
+r = await hit('webdav/env-compare', {})
+assert.equal(r.payload.identical, false)
+assert.deepEqual(r.payload.diff.same, ['same'])
+assert.deepEqual(r.payload.diff.onlyLocal, [{ name: 'only_local', value: 'L' }])
+assert.deepEqual(r.payload.diff.onlyRemote, [{ name: 'only_remote', value: 'R' }])
+assert.deepEqual(r.payload.diff.conflicts, [{ name: 'github_api', local: 'local-1', remote: 'cloud-1' }])
+// merge without a choice for the conflicting name → 409 listing it
+r = await hit('webdav/env-sync', { mode: 'merge' })
+assert.equal(r.status, 409)
+assert.deepEqual(r.payload.conflicts, [{ name: 'github_api', local: 'local-1', remote: 'cloud-1' }])
+// merge choosing the cloud value → same list written to both sides
+r = await hit('webdav/env-sync', { mode: 'merge', choices: { github_api: 'remote' } })
+assert.equal(r.status, 200, r.payload.error)
+const merged = [{ name: 'github_api', value: 'cloud-1' }, { name: 'only_local', value: 'L' }, { name: 'same', value: 'S' }, { name: 'only_remote', value: 'R' }]
+assert.deepEqual((await hit('env')).payload.variables, merged)
+assert.deepEqual(envOf(files.get(ENV)), merged)
+r = await hit('webdav/env-compare', {})
+assert.equal(r.payload.identical, true)
+// cloud overwrites local
+files.set(ENV, Buffer.from(JSON.stringify({ version: 1, variables: [{ name: 'x', value: '1' }] })))
+r = await hit('webdav/env-sync', { mode: 'pull' })
+assert.equal(r.status, 200)
+assert.deepEqual((await hit('env')).payload.variables, [{ name: 'x', value: '1' }])
+// local overwrites cloud
+await hit('env', { force: true, variables: [{ name: 'y', value: '2' }] })
+r = await hit('webdav/env-sync', { mode: 'push' })
+assert.deepEqual(envOf(files.get(ENV)), [{ name: 'y', value: '2' }])
+// a broken cloud file: only push is possible
+files.set(ENV, Buffer.from('oops'))
+r = await hit('webdav/env-compare', {})
+assert.ok(r.payload.remote.error)
+assert.equal((await hit('webdav/env-sync', { mode: 'pull' })).status, 400)
+assert.equal((await hit('webdav/env-sync', { mode: 'merge' })).status, 400)
+assert.equal((await hit('webdav/env-sync', { mode: 'push' })).status, 200)
+assert.equal((await hit('webdav/env-sync', { mode: 'bogus' })).status, 400)
+
 // ── clearing the password
 r = await hit('webdav', { clearPassword: true })
 assert.equal(r.payload.webdav.hasPassword, false)
