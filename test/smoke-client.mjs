@@ -56,15 +56,22 @@ const rows = await source.candidates(session, { query: '', position: 'leading', 
 assert.deepEqual(rows.map(r => r.label), ['代码审查', 'writer'])
 assert.deepEqual((await source.candidates(session, { query: '代码', position: 'leading', signal })).map(r => r.value), ['tabc'])
 
-const pick = source.onPick({ candidate: rows[0], session })
+// Picking inserts plain text; no composer claim (a claim breaks IME input in
+// DSH's composer), and no space-time claim either.
+assert.deepEqual(source.onPick({ candidate: rows[0], session }), { text: '/代码审查 ' })
+assert.equal(source.matchSpace, undefined)
+
+// Enter adjudication claims the draft at send time.
+const pick = await source.matchEnter(session, '/代码审查 你好 世界', signal, { attachments: 0 })
 assert.equal(pick.claim.token, '/代码审查 ')
 assert.equal(pick.claim.name, 'prompt-template')
 assert.deepEqual(await pick.claim.submit('你好 世界', {}, []), { kind: 'success' })
 assert.deepEqual(executed, { sessionId: 's1', line: '/prompt-template tabc 你好 世界', atts: [] })
 
-assert.ok(source.matchSpace(session, '/代码审查'))
-assert.equal(source.matchSpace(session, '/plan'), undefined)
 assert.ok(await source.matchEnter(session, '/writer hello', signal, { attachments: 0 }))
+assert.ok(await source.matchEnter(session, '/代码审查', signal, { attachments: 0 }))
+assert.equal(await source.matchEnter(session, '/代码审查x hi', signal, { attachments: 0 }), undefined)
+assert.equal(await source.matchEnter(session, '/plan', signal, { attachments: 0 }), undefined)
 assert.equal(await source.matchEnter(session, 'hello', signal, { attachments: 0 }), undefined)
 
 // an effective global prompt is mentioned on every template row

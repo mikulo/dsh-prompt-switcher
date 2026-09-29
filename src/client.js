@@ -15,9 +15,10 @@
  *    `{{env:NAME}}` variables (name + value rows); the WebDAV tab can also sync
  *    that file (merge with per-name choices, or either side overwrites).
  * 2. A `/` input-trigger source listing the ACTIVE templates by their `.md`
- *    file name. Picking one claims the composer (`/代码审查 ` + hint); Enter
- *    submits `/prompt-template <id> <message>` to the Host, which binds the
- *    template to a brand-new conversation (see index.js).
+ *    file name. Picking one inserts plain text `/代码审查 ` (no composer claim:
+ *    DSH's claim highlight breaks IME input, see makeSource); Enter adjudicates
+ *    the draft and submits `/prompt-template <id> <message>` to the Host, which
+ *    binds the template to a brand-new conversation (see index.js).
  */
 window.__ModuleLoader__.load({
   id: '@mikulo/dsh-prompt-switcher',
@@ -2050,11 +2051,22 @@ window.__ModuleLoader__.load({
         },
       })
 
-      const leadingName = (line) => {
-        const match = /^\/(\S+)/.exec(line ?? '')
-        return match ? match[1] : undefined
+      /**
+       * The template the draft starts with: `/名称` followed by whitespace or the
+       * end of the line. The longest name wins, so names containing spaces match.
+       */
+      const leadingTemplate = (list, line) => {
+        const text = line ?? ''
+        let best
+        for (const tpl of list) {
+          const token = `/${tpl.name}`
+          if (!text.startsWith(token)) continue
+          const next = text.charAt(token.length)
+          if (next !== '' && !/\s/.test(next)) continue
+          if (best === undefined || tpl.name.length > best.name.length) best = tpl
+        }
+        return best
       }
-      const byToken = (list, token) => list.find(tpl => tpl.name === token)
 
       return {
         trigger: '/',
@@ -2080,26 +2092,27 @@ window.__ModuleLoader__.load({
         warm() {
           loadMenuTemplates().catch(() => {})
         },
-        onPick({ candidate, session }) {
+        // Picking inserts plain text instead of claiming the composer, and
+        // there is deliberately no `matchSpace`: a claim makes DSH's composer
+        // (claim-decor transform, DSH ≤ 0.2.0-rc.1) split the styled token node
+        // on every edit, including IME composition updates, which corrupts
+        // Chinese input typed right after the token (duplicated pinyin, stuck
+        // blue text). The Enter adjudication below claims the draft at send
+        // time instead, so the template is still bound the same way.
+        onPick({ candidate }) {
           const list = menuCache.settled ?? []
           const template = list.find(tpl => tpl.id === candidate.value) ?? { id: candidate.value, name: candidate.name }
-          return claimFor(template, session)
-        },
-        matchSpace(session, token) {
-          const name = leadingName(token)
-          const template = name && byToken(menuCache.settled ?? [], name)
-          return template ? claimFor(template, session) : undefined
+          return { text: `/${template.name} ` }
         },
         async matchEnter(session, line) {
-          const name = leadingName(line)
-          if (!name) return undefined
+          if (!(line ?? '').startsWith('/')) return undefined
           let list
           try {
             list = await loadMenuTemplates()
           } catch {
             return undefined
           }
-          const template = byToken(list, name)
+          const template = leadingTemplate(list, line)
           return template ? claimFor(template, session) : undefined
         },
       }
