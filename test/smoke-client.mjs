@@ -38,7 +38,63 @@ const ctx = {
     })
   },
 }
+// Fake document for the `、` ≡ `/` alias (Chinese IME): records listeners and edit commands.
+const domListeners = {}
+const textNode = {}
+const composerRoot = { isConnected: true, contains: node => node === textNode }
+const composerTarget = { closest: sel => (sel === '[data-composer-input]' ? composerRoot : null) }
+const outsideTarget = { closest: () => null }
+let textBefore = ''
+let execCalls = []
+let modifyCalls = []
+const domSelection = { rangeCount: 1, isCollapsed: true, getRangeAt: () => ({ startContainer: textNode, startOffset: 0 }), modify: (...args) => { modifyCalls.push(args) } }
+globalThis.document = {
+  addEventListener(type, fn, capture) { assert.equal(capture, true); domListeners[type] = fn },
+  removeEventListener(type) { delete domListeners[type] },
+  getSelection: () => domSelection,
+  createRange: () => ({ selectNodeContents() {}, setEnd() {}, toString: () => textBefore }),
+  execCommand(...args) { execCalls.push(args); return true },
+}
+
 plugin.apply(ctx)
+assert.deepEqual(Object.keys(domListeners).sort(), ['beforeinput', 'compositionend'])
+{
+  const beforeInput = (over, before) => {
+    textBefore = before
+    execCalls = []
+    const event = { target: composerTarget, inputType: 'insertText', data: '、', isComposing: false, prevented: false, stopped: false, ...over }
+    event.preventDefault = () => { event.prevented = true }
+    event.stopImmediatePropagation = () => { event.stopped = true }
+    domListeners.beforeinput(event)
+    return event
+  }
+  // direct commit at the start of the draft → replaced by `/`
+  let ev = beforeInput({}, '')
+  assert.ok(ev.prevented && ev.stopped)
+  assert.deepEqual(execCalls, [['insertText', false, '/']])
+  assert.ok(beforeInput({ data: '／' }, '  \n').prevented) // full-width slash, whitespace only before it
+  // never rewritten: mid-text enumeration comma, real `/`, IME composing, other editors, other input types
+  for (const [over, before] of [[{}, '苹果'], [{ data: '/' }, ''], [{ isComposing: true }, ''], [{ target: outsideTarget }, ''], [{ inputType: 'insertFromPaste' }, '']]) {
+    ev = beforeInput(over, before)
+    assert.ok(!ev.prevented && execCalls.length === 0)
+  }
+
+  // composition commit (Pinyin IME): rewritten after compositionend
+  const compositionEnd = async (data, before) => {
+    textBefore = before
+    execCalls = []
+    modifyCalls = []
+    domListeners.compositionend({ target: composerTarget, data })
+    await new Promise(r => setTimeout(r, 10))
+  }
+  await compositionEnd('、', '、')
+  assert.deepEqual(modifyCalls, [['extend', 'backward', 'character']])
+  assert.deepEqual(execCalls, [['insertText', false, '/']])
+  await compositionEnd('、', '苹果、') // enumeration comma inside text stays
+  assert.ok(modifyCalls.length === 0 && execCalls.length === 0)
+  await compositionEnd('你好', '你好')
+  assert.ok(modifyCalls.length === 0 && execCalls.length === 0)
+}
 // pinned by default, then the Host answer (pinTop:false) re-registers it below the built-ins
 assert.equal(registered[0], -100)
 await new Promise(r => setTimeout(r, 10))

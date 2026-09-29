@@ -19,6 +19,9 @@
  *    DSH's claim highlight breaks IME input, see makeSource); Enter adjudicates
  *    the draft and submits `/prompt-template <id> <message>` to the Host, which
  *    binds the template to a brand-new conversation (see index.js).
+ * 3. Chinese-IME alias: a leading `、` (the `/` key under a Chinese IME) is
+ *    rewritten to `/` in the composer, so it opens the same menu (see
+ *    installSlashAlias).
  */
 window.__ModuleLoader__.load({
   id: '@mikulo/dsh-prompt-switcher',
@@ -2118,12 +2121,92 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // ─────────────────────────────────────────────── `、` ≡ `/` (Chinese IME)
+
+    /**
+     * Make a leading `、` (what the `/` key types under a Chinese IME) behave
+     * exactly like `/`. DSH's trigger detection only knows the ASCII `/`
+     * (`TriggerChar = '/' | '@'`), so the source cannot simply bind a second
+     * trigger; instead the composer's text is rewritten to `/` the moment the
+     * alias lands, and DSH's own pipeline then opens the menu as usual.
+     *
+     * Only the LEADING position is rewritten (nothing but whitespace before
+     * it): that is the only place this source offers a menu, and it keeps the
+     * enumeration comma in ordinary Chinese text (`苹果、香蕉`) untouched.
+     *
+     * Two IME styles are covered:
+     * - direct commit → `beforeinput` (`insertText`) is cancelled and `/` is
+     *   inserted in its place;
+     * - composition commit (Microsoft Pinyin, QQ, Sogou, …) → after
+     *   `compositionend`, the just-committed `、` is selected and replaced.
+     *
+     * Everything is scoped to the composer (`[data-composer-input]`), uses
+     * document-level listeners (no DSH file is touched) and is removed again
+     * by the returned disposer.
+     * @param doc - the browser `document` (injectable for tests).
+     * @returns the disposer.
+     */
+    function installSlashAlias(doc) {
+      if (!doc || typeof doc.addEventListener !== 'function') return () => {}
+      const ALIASES = new Set(['、', '／'])
+      const COMPOSER = '[data-composer-input]'
+      const composerOf = (target) => (typeof target?.closest === 'function' ? target.closest(COMPOSER) : null)
+
+      /** Composer text before the selection start; null when the selection is elsewhere. */
+      const textBeforeSelection = (root) => {
+        const sel = doc.getSelection?.()
+        if (!sel || sel.rangeCount === 0) return null
+        const picked = sel.getRangeAt(0)
+        if (!root.contains(picked.startContainer)) return null
+        const range = doc.createRange()
+        range.selectNodeContents(root)
+        range.setEnd(picked.startContainer, picked.startOffset)
+        return range.toString()
+      }
+
+      const onBeforeInput = (event) => {
+        if (event.isComposing || event.inputType !== 'insertText' || !ALIASES.has(event.data)) return
+        const root = composerOf(event.target)
+        if (!root) return
+        const before = textBeforeSelection(root)
+        if (before === null || before.trim() !== '') return
+        event.preventDefault()
+        event.stopImmediatePropagation()
+        doc.execCommand('insertText', false, '/')
+      }
+
+      const onCompositionEnd = (event) => {
+        if (!ALIASES.has(event.data)) return
+        const root = composerOf(event.target)
+        if (!root) return
+        // Let DSH/Lexical finish handling the commit first, then rewrite it.
+        setTimeout(() => {
+          if (!root.isConnected) return
+          const sel = doc.getSelection?.()
+          if (!sel || !sel.isCollapsed) return
+          const before = textBeforeSelection(root)
+          if (before === null || !ALIASES.has(before.slice(-1)) || before.slice(0, -1).trim() !== '') return
+          if (typeof sel.modify === 'function') sel.modify('extend', 'backward', 'character')
+          else doc.execCommand('delete')
+          doc.execCommand('insertText', false, '/')
+        }, 0)
+      }
+
+      doc.addEventListener('beforeinput', onBeforeInput, true)
+      doc.addEventListener('compositionend', onCompositionEnd, true)
+      return () => {
+        doc.removeEventListener('beforeinput', onBeforeInput, true)
+        doc.removeEventListener('compositionend', onCompositionEnd, true)
+      }
+    }
+
     // ─────────────────────────────────────────────── plugin
 
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-prompt-switcher: dictionaries')
+        ctx.effect(() => installSlashAlias(typeof document === 'undefined' ? undefined : document), 'dsh-prompt-switcher: 、 ≡ /')
         const t = ctx.locale.bind(NS)
         hostText = t
         const Page = makePage(t)

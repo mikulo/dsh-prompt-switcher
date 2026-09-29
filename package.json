@@ -1,6 +1,6 @@
 {
   "name": "@mikulo/dsh-prompt-switcher",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "在新对话中通过 / 快速选择本地 .md 提示词模板；模板约束力等同于 AGENTS.md，并对整个对话持续生效。Pick a local .md prompt template with / when starting a new DSH conversation.",
   "type": "module",
   "license": "MIT",
