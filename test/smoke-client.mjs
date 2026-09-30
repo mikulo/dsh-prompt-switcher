@@ -4,8 +4,27 @@ import { readFile } from 'node:fs/promises'
 
 let loaded
 globalThis.window = { __ModuleLoader__: { load(def) { loaded = def } } }
-const React = { createElement: (type, props, ...children) => ({ type, props, children }), useState() {}, useEffect() {}, useRef() {}, useCallback() {}, useMemo() {} }
-const primitives = { Button() {}, Input() {}, Switch() {}, rankByName: (items, q) => items.filter(i => i.name.includes(q)) }
+// Minimal hook runtime: state persists per test "component instance" (reset with resetHooks()).
+let hookSlots = []
+let hookIndex = 0
+const resetHooks = () => { hookSlots = []; hookIndex = 0 }
+const beginRender = () => { hookIndex = 0 }
+const React = {
+  createElement: (type, props, ...children) => ({ type, props, children }),
+  useState(init) {
+    const i = hookIndex++
+    if (!(i in hookSlots)) hookSlots[i] = typeof init === 'function' ? init() : init
+    return [hookSlots[i], (v) => { hookSlots[i] = typeof v === 'function' ? v(hookSlots[i]) : v }]
+  },
+  useEffect(fn) { hookIndex++; fn() },
+  useRef(v) { const i = hookIndex++; if (!(i in hookSlots)) hookSlots[i] = { current: v }; return hookSlots[i] },
+  useCallback(fn) { hookIndex++; return fn },
+  useMemo(fn) { hookIndex++; return fn() },
+}
+const primitives = {
+  Button() {}, Input() {}, Switch() {}, Modal() {}, MenuItemButton() {}, IconTrashOutlineRegular() {},
+  rankByName: (items, q) => items.filter(i => i.name.includes(q)),
+}
 new Function(await readFile(new URL('../lib/client.js', import.meta.url), 'utf8'))()
 assert.equal(loaded.id, '@mikulo/dsh-prompt-switcher')
 const plugin = loaded.factory(id => ({ react: React, '@deepseek-ai/dsh-client-ui-primitives': primitives })[id])
@@ -17,16 +36,44 @@ const TEMPLATES = [{ id: 'tabc', name: '代码审查', file: '代码审查.md' }
 let section, source, executed
 let pinTop = false
 let globalInfo = { effective: false, name: '' }
+let deleteEnabled = false
+const deleteCalls = []
 const TEMPLATES_RESPONSE = () => ({ pinTop, templates: TEMPLATES, global: globalInfo })
-globalThis.fetch = async (url) => ({ ok: true, status: 200, json: async () => (String(url).endsWith('/templates') ? TEMPLATES_RESPONSE() : {}) })
+globalThis.fetch = async (url, init) => {
+  const path = String(url)
+  let body = {}
+  if (path.endsWith('/templates')) body = TEMPLATES_RESPONSE()
+  else if (path.endsWith('/session-delete/settings')) {
+    if (init?.method === 'POST') deleteEnabled = JSON.parse(init.body).enabled
+    body = { hostProtocol: 7, enabled: deleteEnabled }
+  } else if (path.endsWith('/session-delete/archived')) {
+    if (init?.method === 'POST') { deleteCalls.push('archived'); body = { deleted: ['a', 'b'], failed: [], pendingRestart: false } }
+    else body = { count: 2 }
+  } else if (path.endsWith('/session-delete')) {
+    deleteCalls.push(JSON.parse(init.body))
+    body = { deleted: [JSON.parse(init.body).sessionId], pendingRestart: false }
+  }
+  return { ok: true, status: 200, json: async () => body }
+}
 const dict = {}
 const registered = []
+const slotEntries = {}
 let commandResult = { kind: 'success' }
 const commands = { async execute(sessionId, line, atts) { executed = { sessionId, line, atts }; return { ok: true, value: { result: commandResult } } } }
 const ctx = {
   effect(fn) { return fn() },
   locale: { register(ns, d) { dict[ns] = d.zh; return () => {} }, bind: ns => (key, vars) => (dict[ns][key] ?? key).replace(/\{(\w+)\}/g, (_, k) => vars?.[k]) },
-  slots: { inject(name, fn) { assert.equal(name, 'settings.section'); fn() }, register(opts, Page) { section = { opts, Page } } },
+  slots: {
+    inject(name, fn) {
+      assert.ok(['settings.section', 'sidebar.workspaces.session.menu.item', 'shell.overlay'].includes(name), name)
+      fn()
+    },
+    register(opts, Component) {
+      slotEntries[opts.name] = { opts, Component }
+      if (opts.name === 'settings.section') section = { opts, Page: Component }
+      return () => {}
+    },
+  },
   // Regression: the root ctx must never be asked for `remote.commands` directly.
   get(name) { throw new Error(`cannot get property "${name}" without inject`) },
   inject(names, fn) {
@@ -136,6 +183,56 @@ globalInfo = { effective: true, name: '全局规范' }
 await new Promise(r => setTimeout(r, 3100)) // menu cache TTL
 const globalRows = await source.candidates(session, { query: '', position: 'leading', signal })
 assert.equal(globalRows[0].description, '提示词模板 · 追加在全局提示词「全局规范」之后')
+
+// ── "删除对话": menu row hidden while the switch is off, red row + dialog when on
+{
+  const menu = slotEntries['sidebar.workspaces.session.menu.item']
+  const overlay = slotEntries['shell.overlay']
+  assert.equal(menu.opts.id, 'prompt-switcher.delete')
+  assert.ok(menu.opts.order > 400, 'after 归档对话')
+  assert.equal(overlay.opts.id, 'prompt-switcher.session-delete')
+  let menuOpen = true
+  const renderMenu = () => {
+    resetHooks(); beginRender()
+    return menu.Component({ sessionId: 'sess-1', displayTitle: '我的对话', useMenuOpenState: () => [menuOpen, (v) => { menuOpen = v }] })
+  }
+  const renderOverlay = () => { beginRender(); return overlay.Component({}) }
+  await new Promise(r => setTimeout(r, 10))
+  assert.equal(renderMenu(), null, 'hidden while not allowed')
+  assert.equal(renderOverlay(), null, 'no dialog without a request')
+
+  // settings tab toggles the switch on the Host
+  resetHooks(); beginRender()
+  const tabs = section.Page()
+  const tabList = tabs.children.find(c => c?.props?.role === 'tablist')
+  assert.deepEqual(tabList.children[0].map(b => b.children[0]), ['提示词设置', 'WebDAV 云同步', '环境变量', '允许删除对话'])
+  deleteEnabled = true
+  await new Promise(r => setTimeout(r, 10))
+  const row = renderMenu()
+  await new Promise(r => setTimeout(r, 10))
+  const rowOn = renderMenu()
+  assert.ok(rowOn, 'shown when allowed')
+  assert.equal(rowOn.type, primitives.MenuItemButton)
+  assert.equal(rowOn.props.danger, true)
+  assert.equal(rowOn.children[0].props.style.color.includes('error'), true, 'red label')
+  assert.equal(rowOn.children[0].children[0], '删除对话')
+  void row
+  rowOn.props.onSelect()
+  assert.equal(menuOpen, false, 'menu closed')
+  resetHooks()
+  const dialog = renderOverlay() // DeleteSessionDialog → DeleteConfirm element
+  assert.ok(dialog)
+  resetHooks(); beginRender()
+  const modal = dialog.type(dialog.props)
+  assert.equal(modal.type, primitives.Modal)
+  assert.equal(modal.props.description, '是否删除对话，删除不可撤销')
+  const [noBtn, yesBtn] = modal.props.footer.children
+  assert.equal(noBtn.children[0], '否')
+  assert.equal(yesBtn.children[0], '是')
+  await yesBtn.props.onClick()
+  assert.deepEqual(deleteCalls, [{ sessionId: 'sess-1' }])
+  assert.equal(renderOverlay(), null, 'dialog closed after deletion')
+}
 
 // host refusal surfaces as a composer error (draft kept)
 commandResult = { kind: 'error', text: '只能在新对话中使用' }

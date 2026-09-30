@@ -195,6 +195,13 @@ assert.deepEqual(decision.messages, [followUp])
 // rejected steps pass through
 decision = await preStep({ agent, step: 2 }, async () => ({ kind: 'reject' }))
 assert.equal(decision.kind, 'reject')
+// fail-open: an unexpected decision / session shape (future DSH) passes through untouched
+for (const odd of [undefined, { kind: 'enter' }, { kind: 'enter', messages: 'x' }]) {
+  assert.equal(await preStep({ agent, step: 1 }, async () => odd), odd)
+}
+const brokenAgent = { session: { get header() { throw new Error('changed contract') }, deriveMessages() { throw new Error('x') } } }
+const passed = { kind: 'enter', messages: [followUp] }
+assert.equal(await preStep({ agent: brokenAgent, step: 1, turn: 1 }, async () => passed), passed)
 
 // ── global prompt: settings
 r = await hit('state')
@@ -379,6 +386,138 @@ await hit('global', 'POST', { source: 'file', file: 'envglobal.md', enabled: tru
 decision = await preStep({ agent: makeAgent(), step: 1, turn: 1 }, async () => ({ kind: 'enter', messages: [plain] }))
 assert.ok(decision.messages[0].content[0].text.includes('token=123456 gone=.'))
 await hit('global', 'POST', { enabled: false })
+
+// ── delete conversation (opt-in; fake persistence, registries and a live agent)
+{
+  const { existsSync } = await import('node:fs')
+  const sessionsRoot = join(root, 'sessions')
+  const project = join(sessionsRoot, '--D-work--')
+  const headers = {
+    'session-a': { id: 'session-a', cwd: 'D:\\work', delegationDepth: 0 },
+    'session-sub': { id: 'session-sub', cwd: 'D:\\work', origin: 'subagent', parentSession: 'session-a', delegationDepth: 1 },
+    'session-subsub': { id: 'session-subsub', cwd: 'D:\\work', origin: 'subagent', parentSession: 'session-sub', delegationDepth: 2 },
+    'session-fork': { id: 'session-fork', cwd: 'D:\\work', parentSession: 'session-a', isSeeded: true, delegationDepth: 0 },
+    'session-other': { id: 'session-other', cwd: 'D:\\work', delegationDepth: 0 },
+  }
+  for (const id of Object.keys(headers)) {
+    await mkdir(join(project, id), { recursive: true })
+    await writeFile(join(project, id, 'session.jsonl.zstd'), 'x')
+  }
+  const persistence = {
+    async list() { return Object.values(headers).filter(h => existsSync(join(project, h.id))).map(header => ({ header })) },
+    locate(meta) { return { kind: 'jsonl', path: join(sessionsRoot, '--D-work--', plugin.encodeSessionSegment(meta.id), 'session.jsonl.zstd') } },
+  }
+  const liveAgents = new Map([['session-a', {}]])
+  const workspaceCalls = []
+  const workspaceRegistry = {
+    archivedSessionIds: [],
+    async archiveSession(id, options) { workspaceCalls.push(['archive', id, options]) },
+    async unarchiveSession(id) { workspaceCalls.push(['unarchive', id]) },
+    async unpinSession(id) { workspaceCalls.push(['unpin', id]) },
+  }
+  const cacheDeleted = []
+  const services = {
+    sessionPersistence: persistence,
+    workspaceRegistry,
+    agents: { get: id => liveAgents.get(id) },
+    sessions: { get: id => liveAgents.get(id), list: () => [] },
+    sessionProjectionCache: { table: { async delete(id) { cacheDeleted.push(id) } } },
+  }
+  // the live agent's lifecycle effect, the way dsh-agent-loop labels it
+  const lifecycle = Object.assign(async () => { liveAgents.delete('session-a') }, {
+    [Symbol.for('cordis.effect')]: { label: 'agentLoop.lifecycle(session-a)', children: [] },
+  })
+  const emitted = []
+  const dctx = {
+    ...ctx,
+    get: name => services[name],
+    emit: (name, ...args) => emitted.push([name, ...args]),
+    registry: new Map([['runtime', { fibers: [{ _disposables: [() => {}, lifecycle] }] }]]),
+  }
+  routes.clear()
+  plugin.apply(dctx)
+
+  r = await hit('session-delete/settings')
+  assert.deepEqual(r.payload, { hostProtocol: plugin.HOST_PROTOCOL, enabled: false }, 'off by default')
+  r = await hit('session-delete', 'POST', { sessionId: 'session-a' })
+  assert.equal(r.status, 403, 'refused while not allowed')
+  assert.ok(existsSync(join(project, 'session-a')))
+  r = await hit('session-delete/settings', 'POST', { enabled: true })
+  assert.equal(r.payload.enabled, true)
+  assert.equal(JSON.parse(await rf(join(process.env.DSH_HOME, 'dsh-prompt-switcher.json'), 'utf8')).allowDeleteSession, true)
+  // other settings keep the switch
+  await hit('settings', 'POST', { pinTop: true })
+  assert.equal((await hit('session-delete/settings')).payload.enabled, true)
+
+  r = await hit('session-delete', 'POST', { sessionId: 'nope' })
+  assert.equal(r.status, 404)
+  r = await hit('session-delete', 'POST', { sessionId: 'session-sub' })
+  assert.equal(r.status, 400, 'subagent sessions go with their conversation')
+  r = await hit('session-delete', 'POST', { sessionId: 'session-a' })
+  assert.equal(r.status, 200, r.payload.error)
+  assert.deepEqual(r.payload.deleted.sort(), ['session-a', 'session-sub', 'session-subsub'])
+  assert.equal(r.payload.pendingRestart, false)
+  for (const id of ['session-a', 'session-sub', 'session-subsub']) assert.equal(existsSync(join(project, id)), false, id)
+  for (const id of ['session-fork', 'session-other']) assert.ok(existsSync(join(project, id)), `${id} kept`)
+  assert.equal(liveAgents.has('session-a'), false, 'live agent unloaded')
+  assert.deepEqual(workspaceCalls, [['archive', 'session-a', { stopActivity: true }], ['unpin', 'session-a'], ['unarchive', 'session-a']])
+  assert.deepEqual(cacheDeleted.sort(), ['session-a', 'session-sub', 'session-subsub'])
+  assert.deepEqual(emitted.map(e => e[1]).sort(), ['session-a', 'session-sub', 'session-subsub'])
+  assert.ok(emitted.every(e => e[0] === 'api-session/removed'))
+
+  // a located path that is not that session's own directory is never removed (checked before anything changes)
+  persistence.locate = () => ({ path: join(project, 'session-fork', 'session.jsonl.zstd') })
+  workspaceCalls.length = 0
+  r = await hit('session-delete', 'POST', { sessionId: 'session-other' })
+  assert.equal(r.status, 400)
+  assert.deepEqual(workspaceCalls, [], 'not archived either')
+  assert.ok(existsSync(join(project, 'session-fork')) && existsSync(join(project, 'session-other')))
+  assert.equal(plugin.encodeSessionSegment('a/b~c'), 'a~002Fb~007Ec')
+
+  // ── "删除所有已归档": every archived top-level conversation (+ subagents), dangling entries cleared
+  persistence.locate = (meta) => ({ path: join(sessionsRoot, '--D-work--', plugin.encodeSessionSegment(meta.id), 'session.jsonl.zstd') })
+  Object.assign(headers, {
+    'session-b': { id: 'session-b', cwd: 'D:\\work', delegationDepth: 0 },
+    'session-b-sub': { id: 'session-b-sub', cwd: 'D:\\work', origin: 'subagent', parentSession: 'session-b', delegationDepth: 1 },
+    'session-c': { id: 'session-c', cwd: 'D:\\work', delegationDepth: 0 },
+  })
+  for (const id of ['session-b', 'session-b-sub', 'session-c']) {
+    await mkdir(join(project, id), { recursive: true })
+    await writeFile(join(project, id, 'session.jsonl.zstd'), 'x')
+  }
+  workspaceRegistry.archivedSessionIds = ['session-b', 'session-b-sub', 'session-c', 'session-gone']
+  workspaceCalls.length = 0
+  r = await hit('session-delete/archived')
+  assert.deepEqual(r.payload, { count: 2 }, 'top-level archived conversations only')
+  r = await hit('session-delete/archived', 'POST', {})
+  assert.equal(r.status, 200, r.payload.error)
+  assert.deepEqual(r.payload.deleted, ['session-b', 'session-c'])
+  assert.deepEqual(r.payload.failed, [])
+  for (const id of ['session-b', 'session-b-sub', 'session-c']) assert.equal(existsSync(join(project, id)), false, id)
+  for (const id of ['session-fork', 'session-other']) assert.ok(existsSync(join(project, id)), `${id} kept`)
+  assert.ok(!workspaceCalls.some(c => c[0] === 'archive'), 'already archived: not archived again')
+  assert.ok(workspaceCalls.some(c => c[0] === 'unarchive' && c[1] === 'session-gone'), 'dangling entry cleared')
+  // gated by the same switch
+  await hit('session-delete/settings', 'POST', { enabled: false })
+  assert.equal((await hit('session-delete/archived', 'POST', {})).status, 403)
+  assert.equal((await hit('session-delete/archived')).status, 403)
+}
+
+// ── DSH_HOME resolves like DSH itself (dsh-home-paths): `~` expanded
+{
+  const { homedir } = await import('node:os')
+  const saved = process.env.DSH_HOME
+  process.env.DSH_HOME = '~/dsh-ps-home-probe'
+  const probe = join(homedir(), 'dsh-ps-home-probe')
+  try {
+    await hit('session-delete/settings', 'POST', { enabled: true })
+    const { existsSync } = await import('node:fs')
+    assert.ok(existsSync(join(probe, 'dsh-prompt-switcher.json')), 'settings written under the expanded home')
+  } finally {
+    process.env.DSH_HOME = saved
+    await rm(probe, { recursive: true, force: true })
+  }
+}
 
 await rm(root, { recursive: true, force: true })
 console.log('host smoke test: all assertions passed')

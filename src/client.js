@@ -11,9 +11,14 @@
  *    - editor view: large monospace editor with save / discard, Ctrl+S,
  *      conflict detection, live sync with changes made in an external editor,
  *      and a "用其他程序打开…" button that shows the OS "open with" chooser.
- *    Tabs: 提示词设置 / WebDAV 云同步 / 环境变量. The 环境变量 tab edits the
- *    `{{env:NAME}}` variables (name + value rows); the WebDAV tab can also sync
- *    that file (merge with per-name choices, or either side overwrites).
+ *    Tabs: 提示词设置 / WebDAV 云同步 / 环境变量 / 允许删除对话. The 环境变量 tab
+ *    edits the `{{env:NAME}}` variables (name + value rows); the WebDAV tab can
+ *    also sync that file (merge with per-name choices, or either side
+ *    overwrites). The 允许删除对话 tab holds one switch.
+ * 4. While that switch is on, the sidebar session "…" menu gets a red
+ *    "删除对话" row (`sidebar.workspaces.session.menu.item`); it opens a
+ *    `shell.overlay` confirmation, and "是" asks the Host to delete the
+ *    conversation permanently (see index.js).
  * 2. A `/` input-trigger source listing the ACTIVE templates by their `.md`
  *    file name. Picking one inserts plain text `/代码审查 ` (no composer claim:
  *    DSH's claim highlight breaks IME input, see makeSource); Enter adjudicates
@@ -47,7 +52,7 @@ window.__ModuleLoader__.load({
     const ORDER_UNPINNED = 100
     const POLL_MS = 2000
     /** Must equal HOST_PROTOCOL in index.js; a mismatch means `dsh web` still runs an older Host half. */
-    const HOST_PROTOCOL = 6
+    const HOST_PROTOCOL = 8
     /** Select value for a global-prompt file outside the current template folder. */
     const EXTERNAL_FILE = '\u0000external'
 
@@ -273,6 +278,33 @@ window.__ModuleLoader__.load({
       davEnvLosePull: '本地独有的 {count} 个变量（{names}）将会丢失，确定用云端覆盖本地吗？',
       davEnvDone: '同步完成：{mode}，共 {count} 个变量。',
       davEnvRecompare: '重新比较',
+      // delete conversation
+      tabSession: '允许删除对话',
+      delIntro: '开启后，把鼠标移到左侧对话栏的对话标题上，点击出现的“…”图标，菜单中会多出红色的“删除对话”。确认后会彻底删除该对话的会话记录（包括它的子代理会话），无法撤销；从它分叉出来的对话不受影响。对话栏“工作区”右侧的“视图选项”菜单中还会多出红色的“删除所有已归档”，确认后删除全部已归档的对话。',
+      delTitle: '是否允许删除对话',
+      delDesc: '默认关闭。关闭时菜单中不显示“删除对话”，Host 也会拒绝删除请求。',
+      delFile: '设置保存在 ~/.dsh/dsh-prompt-switcher.json，重装插件不会丢失。',
+      delOn: '已开启：对话菜单中显示“删除对话”。',
+      delOff: '已关闭。',
+      delMenu: '删除对话',
+      delDialogTitle: '删除对话',
+      delDialogDesc: '是否删除对话，删除不可撤销',
+      delDialogTarget: '对话：{title}',
+      delUntitled: '（未命名对话）',
+      delYes: '是',
+      delNo: '否',
+      delClose: '关闭',
+      delRunning: '删除中…',
+      delPendingRestart: '对话记录已删除。该对话仍被当前 dsh web 进程加载，已暂时归档隐藏；重启 dsh web 后会完全消失。',
+      delOk: '确定',
+      delArchivedMenu: '删除所有已归档',
+      delArchivedTitle: '删除所有已归档对话',
+      delArchivedDesc: '是否删除所有已归档的对话，删除不可撤销',
+      delArchivedCounting: '正在统计已归档对话…',
+      delArchivedCount: '共 {count} 个已归档对话（连同它们的子代理会话）将被彻底删除。',
+      delArchivedNone: '没有已归档的对话。',
+      delArchivedDone: '已删除 {deleted} 个对话，{failed} 个删除失败：',
+      delArchivedPending: '部分对话仍被当前 dsh web 进程加载，已暂时归档隐藏；重启 dsh web 后会完全消失。',
     }
     const en = {
       nav: 'Prompt templates',
@@ -490,6 +522,32 @@ window.__ModuleLoader__.load({
       davEnvLosePull: '{count} local-only variables ({names}) will be lost. Overwrite the local file with the cloud one?',
       davEnvDone: 'Sync finished: {mode}, {count} variables.',
       davEnvRecompare: 'Compare again',
+      tabSession: 'Delete conversations',
+      delIntro: 'When on, the "…" menu of each conversation in the left sidebar gets a red "Delete conversation" row. Confirming permanently deletes the conversation log (and its subagent sessions); this cannot be undone. Conversations forked from it are kept. The sidebar "View options" menu also gets a red "Delete all archived" row that deletes every archived conversation after confirmation.',
+      delTitle: 'Allow deleting conversations',
+      delDesc: 'Off by default. While off, the menu row is hidden and the Host refuses deletions.',
+      delFile: 'Stored in ~/.dsh/dsh-prompt-switcher.json; reinstalling the plugin keeps it.',
+      delOn: 'On: the conversation menu shows "Delete conversation".',
+      delOff: 'Off.',
+      delMenu: 'Delete conversation',
+      delDialogTitle: 'Delete conversation',
+      delDialogDesc: 'Delete this conversation? This cannot be undone.',
+      delDialogTarget: 'Conversation: {title}',
+      delUntitled: '(untitled)',
+      delYes: 'Yes',
+      delNo: 'No',
+      delClose: 'Close',
+      delRunning: 'Deleting…',
+      delPendingRestart: 'The conversation log was deleted. The running dsh web process still has it loaded, so it stays archived (hidden) until dsh web restarts.',
+      delOk: 'OK',
+      delArchivedMenu: 'Delete all archived',
+      delArchivedTitle: 'Delete all archived conversations',
+      delArchivedDesc: 'Delete every archived conversation? This cannot be undone.',
+      delArchivedCounting: 'Counting archived conversations…',
+      delArchivedCount: '{count} archived conversations (and their subagent sessions) will be permanently deleted.',
+      delArchivedNone: 'There are no archived conversations.',
+      delArchivedDone: 'Deleted {deleted} conversations; {failed} failed:',
+      delArchivedPending: 'Some conversations are still loaded by the running dsh web process; they stay archived (hidden) until dsh web restarts.',
     }
 
     // ─────────────────────────────────────────────── Host API
@@ -558,7 +616,35 @@ window.__ModuleLoader__.load({
       return promise
     }
 
-    /** Last settings tab shown ('prompts' | 'webdav' | 'env'), kept per page load. */
+    /** "允许删除对话": the switch mirrored from the Host, and the pending confirmation. */
+    const deletion = { enabled: false, request: undefined, loading: undefined, listeners: new Set() }
+    let deletionSeq = 0
+    function updateDeletion(patch) {
+      Object.assign(deletion, patch)
+      for (const listener of [...deletion.listeners]) {
+        try { listener() } catch (error) { console.error('[dsh-prompt-switcher] deletion listener failed:', error) }
+      }
+    }
+    /** Refresh the switch from the Host (one request in flight at a time). */
+    function loadDeletion() {
+      deletion.loading ??= call('session-delete/settings').then(
+        (value) => updateDeletion({ enabled: value?.enabled === true }),
+        () => {}, // an outdated Host half has no such route: keep the row hidden
+      ).finally(() => { deletion.loading = undefined })
+      return deletion.loading
+    }
+    /** Re-render when the deletion state changes. */
+    function useDeletion() {
+      const [, setTick] = useState(0)
+      useEffect(() => {
+        const listener = () => setTick(n => n + 1)
+        deletion.listeners.add(listener)
+        return () => { deletion.listeners.delete(listener) }
+      }, [])
+      return deletion
+    }
+
+    /** Last settings tab shown ('prompts' | 'webdav' | 'env' | 'session'), kept per page load. */
     let lastTab = 'prompts'
 
     /** Unsaved editor drafts survive closing the Settings dialog (per page load). */
@@ -1835,6 +1921,324 @@ window.__ModuleLoader__.load({
           : null)
     }
 
+    // ─────────────────────────────────────────────── delete conversation
+
+    const DANGER = 'var(--dsw-alias-state-error-primary, #d93026)'
+
+    /** The “允许删除对话” tab: one switch, saved on its own. */
+    function DeleteSessionView({ t }) {
+      const state = useDeletion()
+      const [busy, setBusy] = useState(false)
+      const [loaded, setLoaded] = useState(false)
+      const [error, setError] = useState(undefined)
+      const alive = useRef(true)
+      useEffect(() => () => { alive.current = false }, [])
+      useEffect(() => {
+        call('session-delete/settings').then(
+          (value) => { updateDeletion({ enabled: value?.enabled === true }) },
+          (cause) => { if (alive.current) setError(errorText(cause)) },
+        ).finally(() => { if (alive.current) setLoaded(true) })
+      }, [])
+
+      const toggle = async (next) => {
+        const previous = state.enabled
+        updateDeletion({ enabled: next })
+        setBusy(true)
+        setError(undefined)
+        try {
+          const value = await call('session-delete/settings', { enabled: next })
+          updateDeletion({ enabled: value?.enabled === true })
+        } catch (cause) {
+          updateDeletion({ enabled: previous })
+          if (alive.current) setError(errorText(cause))
+        } finally {
+          if (alive.current) setBusy(false)
+        }
+      }
+
+      return h('div', { style: styles.section },
+        h('p', { style: styles.intro }, t('delIntro')),
+        h('div', { style: styles.card },
+          h('div', { style: styles.optionRow },
+            h('div', { style: styles.itemText },
+              h('span', { style: { fontSize: 14 } }, t('delTitle')),
+              h('span', { style: styles.muted }, t('delDesc'))),
+            h(Switch, {
+              checked: state.enabled === true,
+              disabled: busy || !loaded,
+              label: t('delTitle'),
+              onChange: toggle,
+            })),
+          h('div', { style: { ...styles.globalRow, borderTop: border } },
+            h('span', { style: styles.muted }, loaded ? (state.enabled ? t('delOn') : t('delOff')) : t('loading')),
+            h('span', { style: styles.muted }, t('delFile')))),
+        error ? h('p', { style: styles.error, role: 'alert' }, error) : null)
+    }
+
+    /**
+     * Row of the sidebar session "…" menu (`sidebar.workspaces.session.menu.item`,
+     * after 置顶 / 重命名 / 分叉 / 归档). Only rendered while the switch is on.
+     */
+    function makeDeleteMenuItem(t) {
+      return function DeleteSessionMenuItem({ sessionId, displayTitle, useMenuOpenState }) {
+        const state = useDeletion()
+        const menuOpen = typeof useMenuOpenState === 'function' ? useMenuOpenState() : undefined
+        useEffect(() => { loadDeletion() }, [])
+        if (!state.enabled || typeof sessionId !== 'string') return null
+        const select = () => {
+          menuOpen?.[1]?.(false)
+          updateDeletion({ request: { sessionId, title: typeof displayTitle === 'string' ? displayTitle : '', seq: ++deletionSeq } })
+        }
+        const label = h('span', { style: { color: DANGER } }, t('delMenu'))
+        if (typeof primitives.MenuItemButton !== 'function') {
+          return h('button', { type: 'button', role: 'menuitem', onClick: select, style: { color: DANGER } }, t('delMenu'))
+        }
+        const Icon = primitives.IconTrashOutlineRegular
+        return h(primitives.MenuItemButton, {
+          danger: true,
+          separatorBefore: true,
+          icon: typeof Icon === 'function' ? h('span', { style: { color: DANGER, display: 'inline-flex' } }, h(Icon, {})) : undefined,
+          onSelect: select,
+        }, label)
+      }
+    }
+
+    /** One confirmation: its busy / error / result state dies with it. */
+    function DeleteConfirm({ t, request }) {
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState(undefined)
+      const [pendingRestart, setPendingRestart] = useState(false)
+      const alive = useRef(true)
+      useEffect(() => () => { alive.current = false }, [])
+      const close = () => {
+        if (busy) return
+        if (deletion.request === request) updateDeletion({ request: undefined })
+      }
+      const confirm = async () => {
+        setBusy(true)
+        setError(undefined)
+        try {
+          const result = await call('session-delete', { sessionId: request.sessionId })
+          if (!alive.current) return
+          if (result?.pendingRestart) {
+            setPendingRestart(true)
+            setBusy(false)
+            return
+          }
+          setBusy(false)
+          if (deletion.request === request) updateDeletion({ request: undefined })
+        } catch (cause) {
+          if (!alive.current) return
+          setBusy(false)
+          setError(errorText(cause))
+        }
+      }
+
+      const target = t('delDialogTarget', { title: request.title.trim() === '' ? t('delUntitled') : request.title })
+      const body = [
+        h('p', { key: 'target', style: { margin: 0, fontSize: 13, overflowWrap: 'anywhere' } }, target),
+        busy ? h('p', { key: 'busy', style: styles.notice, role: 'status' }, t('delRunning')) : null,
+        pendingRestart ? h('p', { key: 'pending', style: styles.notice, role: 'status' }, t('delPendingRestart')) : null,
+        error ? h('p', { key: 'error', style: styles.error, role: 'alert' }, error) : null,
+      ]
+      const footer = pendingRestart
+        ? h(Button, { variant: 'primary', onClick: close }, t('delOk'))
+        : h(React.Fragment ?? 'span', null,
+          h(Button, { variant: 'outline', disabled: busy, onClick: close }, t('delNo')),
+          h(Button, {
+            variant: 'outline',
+            disabled: busy,
+            onClick: confirm,
+            style: { color: DANGER, borderColor: DANGER },
+          }, busy ? t('delRunning') : t('delYes')))
+
+      return confirmDialog({ t, title: t('delDialogTitle'), description: t('delDialogDesc'), body, footer, close })
+    }
+
+    /** DSH's Modal, or a plain fixed overlay when the primitives have none. */
+    function confirmDialog({ t, title, description, body, footer, close }) {
+      if (typeof primitives.Modal === 'function') {
+        return h(primitives.Modal, { open: true, onClose: close, closeLabel: t('delClose'), title, description, footer }, ...body)
+      }
+      return h('div', {
+        role: 'dialog',
+        'aria-modal': true,
+        style: { position: 'fixed', inset: 0, zIndex: 1000, display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(0,0,0,0.35)' },
+        onClick: (event) => { if (event.target === event.currentTarget) close() },
+      }, h('div', {
+        style: { minWidth: 320, maxWidth: 440, padding: 20, borderRadius: 12, background: 'var(--dsw-alias-bg-l1, #fff)', color: 'var(--dsw-alias-label-primary, #000)', display: 'flex', flexDirection: 'column', gap: 10 },
+      },
+      h('h3', { style: { margin: 0, fontSize: 16 } }, title),
+      h('p', { style: { margin: 0, fontSize: 14 } }, description),
+      ...body,
+      h('div', { style: styles.actions }, footer)))
+    }
+
+    /** "删除所有已归档": count first, then delete every archived conversation. */
+    function DeleteArchivedConfirm({ t, request }) {
+      const [count, setCount] = useState(undefined)
+      const [busy, setBusy] = useState(false)
+      const [error, setError] = useState(undefined)
+      const [result, setResult] = useState(undefined) // { deleted, failed, pendingRestart }
+      const alive = useRef(true)
+      useEffect(() => () => { alive.current = false }, [])
+      useEffect(() => {
+        call('session-delete/archived').then(
+          (value) => { if (alive.current) setCount(typeof value?.count === 'number' ? value.count : 0) },
+          (cause) => { if (alive.current) setError(errorText(cause)) },
+        )
+      }, [])
+      const close = () => {
+        if (busy) return
+        if (deletion.request === request) updateDeletion({ request: undefined })
+      }
+      const confirm = async () => {
+        setBusy(true)
+        setError(undefined)
+        try {
+          const value = await call('session-delete/archived', {})
+          if (!alive.current) return
+          setBusy(false)
+          const failed = Array.isArray(value?.failed) ? value.failed : []
+          if (failed.length > 0 || value?.pendingRestart) {
+            setResult({ deleted: value?.deleted?.length ?? 0, failed, pendingRestart: value?.pendingRestart === true })
+            return
+          }
+          if (deletion.request === request) updateDeletion({ request: undefined })
+        } catch (cause) {
+          if (!alive.current) return
+          setBusy(false)
+          setError(errorText(cause))
+        }
+      }
+
+      let status
+      if (result) status = null
+      else if (count === undefined) status = error ? null : t('delArchivedCounting')
+      else status = count === 0 ? t('delArchivedNone') : t('delArchivedCount', { count })
+      const body = [
+        status ? h('p', { key: 'count', style: { margin: 0, fontSize: 13 } }, status) : null,
+        busy ? h('p', { key: 'busy', style: styles.notice, role: 'status' }, t('delRunning')) : null,
+        result && result.failed.length > 0
+          ? h('div', { key: 'failed', style: { display: 'flex', flexDirection: 'column', gap: 4 } },
+            h('p', { style: styles.error, role: 'alert' }, t('delArchivedDone', { deleted: result.deleted, failed: result.failed.length })),
+            ...result.failed.map(f => h('span', { key: f.sessionId, style: { ...styles.muted, overflowWrap: 'anywhere' } }, `${f.sessionId}：${f.error}`)))
+          : null,
+        result?.pendingRestart ? h('p', { key: 'pending', style: styles.notice, role: 'status' }, t('delArchivedPending')) : null,
+        error ? h('p', { key: 'error', style: styles.error, role: 'alert' }, error) : null,
+      ]
+      const footer = result || count === 0
+        ? h(Button, { variant: 'primary', onClick: close }, t('delOk'))
+        : h(React.Fragment ?? 'span', null,
+          h(Button, { variant: 'outline', disabled: busy, onClick: close }, t('delNo')),
+          h(Button, {
+            variant: 'outline',
+            disabled: busy || count === undefined,
+            onClick: confirm,
+            style: { color: DANGER, borderColor: DANGER },
+          }, busy ? t('delRunning') : t('delYes')))
+      return confirmDialog({ t, title: t('delArchivedTitle'), description: t('delArchivedDesc'), body, footer, close })
+    }
+
+    /**
+     * "删除所有已归档" in the sidebar "视图选项" menu (the button right of
+     * "工作区"). DSH renders that menu from a fixed `items` list with no slot,
+     * so the row is added to its DOM when the portaled list appears: the list
+     * carries the `…_viewOptionsMenu` class (CSS-module hash prefix varies),
+     * and its "隐藏已归档" row is the fallback marker. The row copies the
+     * classes of an existing row for the native look, is red, closes the menu
+     * with Escape (the Menu's own close path) and opens the confirmation.
+     * @param doc - the browser `document` (injectable for tests).
+     * @param t - locale lookup.
+     * @returns the disposer.
+     */
+    function installDeleteArchivedRow(doc, t) {
+      if (!doc?.body || typeof MutationObserver === 'undefined') return () => {}
+      const MARK = 'data-prompt-switcher-delete-archived'
+      const HIDE_ARCHIVED = new Set(['隐藏已归档', 'Hide archived'])
+      /** aria-label of the menu's trigger button (dsh-client-ui-workspace `viewOptions.label`). */
+      const VIEW_OPTIONS = new Set(['视图选项', 'View options'])
+      const TRASH = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+        '<path d="M2.5 4h11M6.5 4V2.5h3V4M4 4l.6 9a1 1 0 0 0 1 .9h4.8a1 1 0 0 0 1-.9L12 4M6.8 6.5v5M9.2 6.5v5"/></svg>'
+
+      const isViewOptions = (menu) => {
+        if (String(menu.className ?? '').includes('_viewOptionsMenu')) return true
+        return [...menu.querySelectorAll('button[role="menuitem"]')].some(b => HIDE_ARCHIVED.has(b.textContent.trim()))
+      }
+      const addRow = (menu) => {
+        if (!deletion.enabled || menu.querySelector(`[${MARK}]`) || !isViewOptions(menu)) return
+        const sample = [...menu.querySelectorAll('button[role="menuitem"]')].find(b => HIDE_ARCHIVED.has(b.textContent.trim())) ??
+          menu.querySelector('button[role="menuitem"]')
+        if (!sample) return
+        const container = sample.parentElement?.parentElement ?? menu
+        const separator = menu.querySelector('[role="separator"]')
+        if (separator) {
+          const line = separator.cloneNode(false)
+          line.setAttribute(MARK, 'separator')
+          container.appendChild(line)
+        }
+        const wrap = doc.createElement('div')
+        wrap.className = sample.parentElement?.className ?? ''
+        wrap.setAttribute(MARK, 'row')
+        const button = doc.createElement('button')
+        button.type = 'button'
+        button.setAttribute('role', 'menuitem')
+        button.className = [...sample.classList].filter(c => !/selected/i.test(c)).join(' ')
+        button.style.color = DANGER
+        const spans = [...sample.children].filter(el => el.tagName === 'SPAN')
+        const iconClass = spans.length >= 2 ? spans[0].className : ''
+        const labelClass = spans.length >= 2 ? spans[1].className : spans[0]?.className ?? ''
+        const icon = doc.createElement('span')
+        icon.className = iconClass
+        icon.style.color = DANGER
+        icon.innerHTML = TRASH
+        const label = doc.createElement('span')
+        label.className = labelClass
+        label.textContent = t('delArchivedMenu')
+        button.append(icon, label)
+        button.addEventListener('click', (event) => {
+          event.stopPropagation()
+          // Close the menu through its own trigger (a toggle) when it is unambiguous;
+          // otherwise through Escape, which the Menu handles itself.
+          const triggers = [...doc.querySelectorAll('button[aria-label]')].filter(b => VIEW_OPTIONS.has(b.getAttribute('aria-label')))
+          if (triggers.length === 1) triggers[0].click()
+          else menu.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+          updateDeletion({ request: { kind: 'archived', seq: ++deletionSeq } })
+        })
+        wrap.appendChild(button)
+        container.appendChild(wrap)
+      }
+      const scan = () => {
+        try {
+          for (const menu of doc.querySelectorAll('[role="menu"]')) addRow(menu)
+        } catch (error) {
+          console.warn('[dsh-prompt-switcher] 删除所有已归档 row skipped:', error)
+        }
+      }
+      // Portaled lists are direct children of <body>; watching only that level stays cheap.
+      const observer = new MutationObserver((records) => {
+        if (records.some(r => r.addedNodes.length > 0)) {
+          scan()
+          requestAnimationFrame?.(scan)
+        }
+      })
+      observer.observe(doc.body, { childList: true })
+      return () => {
+        observer.disconnect()
+        for (const node of doc.querySelectorAll(`[${MARK}]`)) node.remove()
+      }
+    }
+
+    /** `shell.overlay` entry: the confirmation outlives the session menu that raised it. */
+    function makeDeleteDialog(t) {
+      return function DeleteSessionDialog() {
+        const state = useDeletion()
+        const request = state.request
+        if (!request) return null
+        return h(request.kind === 'archived' ? DeleteArchivedConfirm : DeleteConfirm, { key: request.seq, t, request })
+      }
+    }
+
     // ─────────────────────────────────────────────── list view + page
 
     function makePage(t) {
@@ -1950,7 +2354,7 @@ window.__ModuleLoader__.load({
           h('h2', { key: 'title', style: styles.heading }, t('title'), h('span', { style: { ...styles.muted, fontWeight: 400, marginLeft: 8 } }, `v${VERSION}`)),
           hostOutdated ? h('div', { key: 'outdated', style: styles.banner('error'), role: 'alert' }, h('span', { style: styles.bannerText }, t('hostOutdated'))) : null,
           h('div', { key: 'tabs', style: styles.tabs, role: 'tablist' },
-            [['prompts', t('tabPrompts')], ['webdav', t('tabWebdav')], ['env', t('tabEnv')]].map(([id, label]) => h('button', {
+            [['prompts', t('tabPrompts')], ['webdav', t('tabWebdav')], ['env', t('tabEnv')], ['session', t('tabSession')]].map(([id, label]) => h('button', {
               key: id,
               type: 'button',
               role: 'tab',
@@ -1962,6 +2366,10 @@ window.__ModuleLoader__.load({
 
         if (tab === 'env') {
           return h('div', { style: styles.section }, ...header, h(EnvView, { t }))
+        }
+
+        if (tab === 'session') {
+          return h('div', { style: styles.section }, ...header, h(DeleteSessionView, { t }))
         }
 
         if (tab === 'webdav') {
@@ -2192,11 +2600,21 @@ window.__ModuleLoader__.load({
         }, 0)
       }
 
-      doc.addEventListener('beforeinput', onBeforeInput, true)
-      doc.addEventListener('compositionend', onCompositionEnd, true)
+      // Document-level listeners see every keystroke on the page: never let them throw.
+      const guarded = (fn) => (event) => {
+        try {
+          fn(event)
+        } catch (error) {
+          console.warn('[dsh-prompt-switcher] 、→/ alias skipped:', error)
+        }
+      }
+      const beforeInput = guarded(onBeforeInput)
+      const compositionEnd = guarded(onCompositionEnd)
+      doc.addEventListener('beforeinput', beforeInput, true)
+      doc.addEventListener('compositionend', compositionEnd, true)
       return () => {
-        doc.removeEventListener('beforeinput', onBeforeInput, true)
-        doc.removeEventListener('compositionend', onCompositionEnd, true)
+        doc.removeEventListener('beforeinput', beforeInput, true)
+        doc.removeEventListener('compositionend', compositionEnd, true)
       }
     }
 
@@ -2205,19 +2623,47 @@ window.__ModuleLoader__.load({
     return {
       inject: ['slots', 'locale'],
       apply(ctx) {
+        /**
+         * Each feature is installed on its own: a DSH change that breaks one
+         * (a renamed slot contract, a DOM change) is logged and leaves the
+         * others — above all the settings page, where features are turned off — working.
+         */
+        const safely = (label, install) => {
+          try {
+            install()
+          } catch (error) {
+            console.warn(`[dsh-prompt-switcher] ${label} not installed:`, error)
+          }
+        }
         ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-prompt-switcher: dictionaries')
-        ctx.effect(() => installSlashAlias(typeof document === 'undefined' ? undefined : document), 'dsh-prompt-switcher: 、 ≡ /')
         const t = ctx.locale.bind(NS)
         hostText = t
         const Page = makePage(t)
 
-        ctx.slots.inject('settings.section', () => ctx.slots.register({
+        safely('settings page', () => ctx.slots.inject('settings.section', () => ctx.slots.register({
           name: 'settings.section',
           id: SECTION_ID,
           order: 25,
           label: () => t('nav'),
           locale: NS,
-        }, Page))
+        }, Page)))
+        safely('、 ≡ /', () => ctx.effect(() => installSlashAlias(typeof document === 'undefined' ? undefined : document), 'dsh-prompt-switcher: 、 ≡ /'))
+
+        // "删除对话" in the sidebar session menu, plus its confirmation dialog.
+        // The menu unmounts when it closes, so the dialog lives in `shell.overlay`.
+        safely('删除对话 menu row', () => ctx.slots.inject('sidebar.workspaces.session.menu.item', () => ctx.slots.register({
+          name: 'sidebar.workspaces.session.menu.item',
+          id: 'prompt-switcher.delete',
+          order: 500,
+          locale: NS,
+        }, makeDeleteMenuItem(t))))
+        safely('删除对话 dialog', () => ctx.slots.inject('shell.overlay', () => ctx.slots.register({
+          name: 'shell.overlay',
+          id: 'prompt-switcher.session-delete',
+          locale: NS,
+        }, makeDeleteDialog(t))))
+        loadDeletion()
+        safely('删除所有已归档 row', () => ctx.effect(() => installDeleteArchivedRow(typeof document === 'undefined' ? undefined : document, t), 'dsh-prompt-switcher: 删除所有已归档'))
 
         // The `/` source needs the trigger pipeline and the Host command RPC.
         // Declaring `remote.commands` here is what makes `tctx.remote.commands`
